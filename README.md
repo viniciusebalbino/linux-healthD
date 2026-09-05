@@ -105,3 +105,9 @@ healthD is a local Linux health dashboard (journal, systemd, live metrics, disk,
 ## Licença
 
 MIT
+
+![alt text](images/multidispositivo.png)
+![alt text](images/dashservices.png)
+![alt text](images/dashmelhorias.png)
+![alt text](images/dashjournal.png)
+![alt text](images/dashhardware.png)
