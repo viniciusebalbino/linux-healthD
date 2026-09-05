@@ -200,6 +200,24 @@ EOF
   chmod 644 "$CONF"
 }
 
+open_firewall() {
+  port=${1:-9999}
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null
+    firewall-cmd --reload >/dev/null
+    log "firewalld: porta ${port}/tcp liberada"
+    return
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi 'Status: active'; then
+      ufw allow "${port}/tcp" >/dev/null
+      log "ufw: porta ${port}/tcp liberada"
+      return
+    fi
+  fi
+  log "se a LAN não abrir, libere a porta ${port}/tcp no firewall"
+}
+
 write_unit() {
   mkdir -p "$STATE"
   chmod 700 "$STATE"
@@ -270,6 +288,7 @@ main() {
   systemctl daemon-reload
   systemctl enable healthd.service
   systemctl start healthd.service
+  open_firewall 9999
   if systemctl is-active --quiet healthd.service; then
     log "healthD instalado e ativo"
     log "painel: http://IP-DA-MAQUINA:9999  (login = usuário Linux no grupo healthd)"

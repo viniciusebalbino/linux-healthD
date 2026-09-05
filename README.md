@@ -60,7 +60,15 @@ sudo sh install.sh
 
 O script copia os arquivos para `/usr/linux-healthd/`, cria um env Python ali se a distro permitir (e instala `requirements.txt` via pip, se existir), registra o serviço **healthd**, dá `enable` e `start`.
 
-O serviço escuta em **0.0.0.0:9999** (IP da máquina na LAN) **com login**. Host/porta: `/etc/linux-healthd.conf` → `systemctl restart healthd`. Se ainda não abrir, libere a porta 9999 no firewall (firewalld, ufw, nftables).
+O serviço escuta em **0.0.0.0:9999** (IP da máquina na LAN) **com login**. Host/porta: `/etc/linux-healthd.conf` → `systemctl restart healthd`.
+
+O instalador tenta liberar a porta 9999 no firewalld/ufw. Se ainda não abrir na LAN (Fedora/RHEL costuma recusar com “No route to host”):
+
+```bash
+sudo firewall-cmd --permanent --add-port=9999/tcp
+sudo firewall-cmd --reload
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9999/login
+```
 
 O instalador cria o grupo Linux **`healthd`** e coloca o usuário que rodou o `sudo` nele. Só quem está nesse grupo entra no painel (usuário + senha locais, via PAM). Depois de `usermod -aG healthd USER`, saia e entre na sessão (ou `newgrp healthd`) para o grupo valer.
 
