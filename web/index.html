@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>healthD</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23070a0e'/%3E%3Ccircle cx='16' cy='16' r='7' fill='%239dff6a'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/assets/app.css?v=19">
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">
+        <span class="brand__mark" aria-hidden="true"></span>
+        <div>
+          <strong>healthD</strong>
+          <small>saúde da máquina</small>
+        </div>
+      </div>
+
+      <nav class="tabs" aria-label="Seções">
+        <button type="button" data-tab="journal" class="is-on">Journal</button>
+        <button type="button" data-tab="services">Serviços</button>
+        <button type="button" data-tab="live">Sistema</button>
+        <button type="button" data-tab="machine">Máquina</button>
+        <button type="button" data-tab="disk">Disco</button>
+      </nav>
+
+      <div id="railJournal">
+      <section class="beacons" aria-label="Faróis de saúde">
+        <h2>Faróis</h2>
+        <div id="beacons" class="beacons__list"></div>
+      </section>
+
+      <section class="range" aria-label="Período">
+        <h2>Janela</h2>
+        <div class="chips" id="ranges">
+          <button type="button" data-since="1h">1h</button>
+          <button type="button" data-since="6h">6h</button>
+          <button type="button" data-since="24h" class="is-on">24h</button>
+          <button type="button" data-since="7d">7d</button>
+          <button type="button" data-since="boot">boot</button>
+        </div>
+      </section>
+
+      <p class="rail__meta" id="sourceMeta">lendo journalctl…</p>
+      </div>
+
+      <div id="railServices" hidden>
+        <section class="beacons" aria-label="Estado dos serviços">
+          <h2>systemd</h2>
+          <div id="serviceBeacons" class="beacons__list"></div>
+        </section>
+        <section class="range" aria-label="Período dos logs">
+          <h2>Janela dos logs</h2>
+          <div class="chips" id="serviceRanges">
+            <button type="button" data-since="1h">1h</button>
+            <button type="button" data-since="6h">6h</button>
+            <button type="button" data-since="24h" class="is-on">24h</button>
+            <button type="button" data-since="7d">7d</button>
+            <button type="button" data-since="boot">boot</button>
+          </div>
+        </section>
+        <p class="rail__meta" id="servicesMeta">lendo systemctl…</p>
+      </div>
+
+      <div id="railLive" hidden>
+        <section class="beacons" aria-label="Faróis ao vivo">
+          <h2>Agora</h2>
+          <div id="liveBeacons" class="beacons__list"></div>
+        </section>
+        <p class="rail__meta" id="liveMeta">coletando métricas…</p>
+      </div>
+
+      <div id="railMachine" hidden>
+        <section class="beacons" aria-label="Gargalos">
+          <h2>Gargalos</h2>
+          <div id="machineBeacons" class="beacons__list"></div>
+        </section>
+        <p class="rail__meta" id="machineMeta">lendo hardware…</p>
+      </div>
+
+      <div id="railDisk" hidden>
+        <section class="range" aria-label="Onde medir">
+          <h2>Origem</h2>
+          <div class="chips" id="diskTargets"></div>
+        </section>
+        <label class="search disk-path">
+          <span class="sr-only">Caminho</span>
+          <input id="diskPath" type="text" placeholder="/caminho/para/medir" spellcheck="false">
+        </label>
+        <button type="button" class="ghost" id="diskScanBtn">Medir este caminho</button>
+        <section class="beacons" aria-label="Capacidade">
+          <h2>Volume</h2>
+          <div id="diskBeacons" class="beacons__list"></div>
+        </section>
+        <p class="rail__meta" id="diskMeta">ainda não medido</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="hostbar" id="hostBar">
+        <div class="hostbar__pick">
+          <button type="button" class="hostbar__current" id="hostCurrent" aria-expanded="false" aria-haspopup="listbox">
+            <span class="lamp ok" id="hostLamp"></span>
+            <span>
+              <b id="hostName">esta máquina</b>
+              <small id="hostAddr">local</small>
+            </span>
+          </button>
+          <div class="hostbar__menu" id="hostMenu" hidden>
+            <label class="search hostbar__filter">
+              <span class="sr-only">Filtrar hosts pelo nome</span>
+              <input id="hostFilter" type="search" placeholder="Filtrar pelo nome…" autocomplete="off" spellcheck="false">
+            </label>
+            <div id="hostList" class="hostbar__list" role="listbox"></div>
+          </div>
+        </div>
+        <button type="button" class="ghost" id="hostManageBtn">Hosts</button>
+      </div>
+      <header class="top">
+        <div>
+          <p class="kicker" id="kicker">Relatório operacional</p>
+          <h1 id="pageTitle">O que o journal está tentando te dizer</h1>
+        </div>
+        <div class="top__actions">
+          <button type="button" class="ghost" id="aiStatusBtn">IA Tips</button>
+          <button type="button" class="ghost" id="refreshBtn">Atualizar</button>
+          <span class="clock" id="clock">—</span>
+        </div>
+      </header>
+
+      <p class="banner" id="banner" hidden></p>
+
+      <div id="viewJournal">
+      <section class="kpis" id="kpis"></section>
+
+      <section class="grid">
+        <article class="panel panel--wide">
+          <header>
+            <h2>Linha do tempo</h2>
+            <p>Volume por severidade no período</p>
+          </header>
+          <div class="chart" id="timelineChart"></div>
+        </article>
+        <article class="panel">
+          <header>
+            <h2>Severidade</h2>
+            <p>Distribuição dos eventos</p>
+          </header>
+          <div class="chart chart--donut" id="severityChart"></div>
+        </article>
+        <article class="panel">
+          <header>
+            <h2>Aplicações</h2>
+            <p>Quem mais gera ruído e risco</p>
+          </header>
+          <div class="bars" id="appsChart"></div>
+        </article>
+        <article class="panel">
+          <header>
+            <h2>Unidades</h2>
+            <p>Serviços systemd e kernel</p>
+          </header>
+          <div class="bars" id="unitsChart"></div>
+        </article>
+      </section>
+
+      <section class="panel panel--table">
+        <header>
+          <h2>Surgiu neste boot</h2>
+          <p>Comparado com o boot anterior</p>
+        </header>
+        <div class="table-wrap" id="bootNew"></div>
+      </section>
+
+      <section class="panel panel--table">
+        <header class="table-head">
+          <div>
+            <h2>Problemas agrupados</h2>
+            <p>Filtre, ordene e abra um evento para ver amostras reais</p>
+          </div>
+          <div class="filters">
+            <label class="search">
+              <span class="sr-only">Filtrar problemas</span>
+              <input id="search" type="search" placeholder="Filtrar mensagem, app ou unidade" autocomplete="off">
+            </label>
+            <label>
+              <span class="sr-only">Aplicação</span>
+              <select id="appFilter">
+                <option value="">Todas as apps</option>
+              </select>
+            </label>
+            <label>
+              <span class="sr-only">Ordenar</span>
+              <select id="sortFilter">
+                <option value="impact">Impacto</option>
+                <option value="count">Ocorrências</option>
+                <option value="improvement">Melhoria estimada</option>
+                <option value="recent">Mais recente</option>
+                <option value="boot">Novo neste boot</option>
+              </select>
+            </label>
+          </div>
+          <div class="sev-filters" id="sevFilters"></div>
+          <div class="chips" id="bootFilter">
+            <button type="button" data-boot="all" class="is-on">Todos</button>
+            <button type="button" data-boot="new">Só neste boot</button>
+          </div>
+        </header>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Sev.</th>
+                <th>Problema</th>
+                <th>Aplicação</th>
+                <th>Vezes</th>
+                <th>%</th>
+                <th>Impacto</th>
+                <th>Melhoria</th>
+                <th>Última vez</th>
+                <th>Boot</th>
+                <th>IA</th>
+              </tr>
+            </thead>
+            <tbody id="issueBody"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="emptyIssues" hidden>Nenhum problema com esse filtro.</p>
+      </section>
+
+      <footer class="foot">
+        Sem telemetria de produto. As dicas de IA só saem da máquina quando você clica em
+        <strong>IA Tips</strong> ( Groq / Gemini / OpenRouter no plano gratuito ).
+      </footer>
+      </div>
+
+      <div id="viewServices" hidden>
+        <section class="grid diagnose">
+          <article class="panel panel--table">
+            <header>
+              <h2>Unidades instáveis</h2>
+              <p>systemctl --failed e reinícios em loop</p>
+            </header>
+            <div class="table-wrap" id="failedUnits"></div>
+          </article>
+        </section>
+        <section class="panel panel--table unit-browser">
+          <header class="table-head">
+            <div>
+              <h2>Serviços agora</h2>
+              <p>Running, stopped e failed — clique para ver o journal da unidade</p>
+            </div>
+            <div class="filters">
+              <label class="search">
+                <span class="sr-only">Filtrar serviços</span>
+                <input id="unitSearch" type="search" placeholder="Filtrar unidade ou descrição" autocomplete="off">
+              </label>
+            </div>
+            <div class="chips" id="unitStateFilter">
+              <button type="button" data-unit-state="all" class="is-on">Todos</button>
+              <button type="button" data-unit-state="running">Running</button>
+              <button type="button" data-unit-state="stopped">Stopped</button>
+              <button type="button" data-unit-state="failed">Failed</button>
+              <button type="button" data-unit-state="active">Ativo (exited)</button>
+            </div>
+          </header>
+          <div class="unit-split">
+            <div class="table-wrap" id="unitList"></div>
+            <div class="unit-log">
+              <header id="unitLogHead">
+                <div>
+                  <h3>Journal da unidade</h3>
+                  <p>Equivale a <span class="mono">journalctl -u unidade.service</span></p>
+                </div>
+                <div class="unit-log-actions">
+                  <button type="button" class="ghost" id="unitLogRefresh" hidden>Atualizar logs</button>
+                  <button type="button" class="ghost btn-disable" id="unitDisable" hidden>Disable</button>
+                </div>
+              </header>
+              <section class="tips unit-ai" id="unitAi" hidden></section>
+              <div class="log-stream" id="unitLog">
+                <p class="empty">Clique num serviço à esquerda para ler só os logs dele.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div id="viewLive" hidden>
+        <section class="kpis" id="liveKpis"></section>
+        <section class="grid">
+          <article class="panel panel--wide">
+            <header>
+              <h2>CPU e load</h2>
+              <p>Utilização e load average em tempo real</p>
+            </header>
+            <div class="chart" id="liveCpuChart"></div>
+            <div class="cores" id="liveCores"></div>
+          </article>
+          <article class="panel">
+            <header>
+              <h2>Memória</h2>
+              <p>RAM usada vs disponível</p>
+            </header>
+            <div class="chart" id="liveMemChart"></div>
+          </article>
+          <article class="panel">
+            <header>
+              <h2>Pressão (PSI)</h2>
+              <p>Filas de memória e I/O — mais honesto que load average</p>
+            </header>
+            <div class="chart" id="livePsiChart"></div>
+          </article>
+          <article class="panel">
+            <header>
+              <h2>Disco</h2>
+              <p>Leitura e escrita</p>
+            </header>
+            <div class="chart" id="liveDiskChart"></div>
+            <div class="bars" id="liveDisks"></div>
+          </article>
+          <article class="panel panel--wide">
+            <header>
+              <h2>Rede</h2>
+              <p>Entrada e saída das interfaces</p>
+            </header>
+            <div class="chart" id="liveNetChart"></div>
+            <div class="bars" id="liveIfaces"></div>
+          </article>
+        </section>
+        <section class="grid diagnose">
+          <article class="panel panel--table">
+            <header>
+              <h2>OOM neste boot</h2>
+              <p>Processos mortos por falta de memória</p>
+            </header>
+            <div class="table-wrap" id="liveOom"></div>
+          </article>
+          <article class="panel">
+            <header>
+              <h2>Journal agora</h2>
+              <p>O log em paralelo com as métricas</p>
+            </header>
+            <div id="liveJournalPulse"></div>
+          </article>
+        </section>
+        <section class="grid live-offenders">
+          <article class="panel">
+            <header><h2>Top 10 CPU</h2><p>Ofensores de processamento</p></header>
+            <div class="table-wrap" id="topCpu"></div>
+          </article>
+          <article class="panel">
+            <header><h2>Top 10 memória</h2><p>Resident set (RSS)</p></header>
+            <div class="table-wrap" id="topMem"></div>
+          </article>
+          <article class="panel">
+            <header><h2>Top 10 disco</h2><p>Read + write por processo</p></header>
+            <div class="table-wrap" id="topDisk"></div>
+          </article>
+          <article class="panel">
+            <header><h2>Top 10 rede</h2><p>Conexões (sockets) por processo</p></header>
+            <div class="table-wrap" id="topNet"></div>
+          </article>
+          <article class="panel panel--wide">
+            <header>
+              <h2>Top 5 load average</h2>
+              <p>Quem mais empurra o load (R = rodando, D = espera de I/O)</p>
+            </header>
+            <div class="table-wrap" id="topLoad"></div>
+          </article>
+        </section>
+      </div>
+
+      <div id="viewMachine" hidden>
+        <section class="kpis" id="machineKpis"></section>
+        <section class="grid">
+          <article class="panel">
+            <header>
+              <h2>Inventário</h2>
+              <p>O que esta máquina tem hoje</p>
+            </header>
+            <dl class="facts" id="machineFacts"></dl>
+          </article>
+          <article class="panel">
+            <header>
+              <h2>Uso observado</h2>
+              <p>Média e pico enquanto o painel coleta CPU, RAM, I/O e journal</p>
+            </header>
+            <dl class="facts" id="machineUsage"></dl>
+          </article>
+        </section>
+        <section class="panel panel--table">
+          <header>
+            <h2>Gargalos detectados</h2>
+            <p>Heurística local a partir de uso, PSI, journal e systemd</p>
+          </header>
+          <div id="machineBottlenecks"></div>
+        </section>
+        <section class="panel panel--table">
+          <header class="table-head">
+            <div>
+              <h2>Análise da IA</h2>
+              <p>Software para desempenho/estabilidade e upgrades de hardware</p>
+            </div>
+            <button type="button" class="btn-ai" id="machineTipsBtn">Analisar com IA</button>
+          </header>
+          <div id="machineAi" class="machine-ai">
+            <p class="empty">A IA cruza hardware, uso, journal e serviços failed.</p>
+          </div>
+        </section>
+      </div>
+
+      <div id="viewDisk" hidden>
+        <section class="kpis" id="diskKpis"></section>
+        <nav class="disk-crumb" id="diskCrumb" aria-label="Caminho inspecionado"></nav>
+        <section class="disk-stage">
+          <article class="panel panel--table">
+            <header>
+              <h2>Pastas</h2>
+              <p>Árvore dos diretórios que mais ocupam espaço</p>
+            </header>
+            <div class="table-wrap" id="diskTable"></div>
+          </article>
+          <article class="panel">
+            <header class="table-head">
+              <div>
+                <h2>Mapa do disco</h2>
+                <p>Fatias e quadrados proporcionais ao tamanho. Clique para inspecionar.</p>
+              </div>
+              <div class="chips" id="diskView">
+                <button type="button" data-disk-view="rings" class="is-on">Anéis</button>
+                <button type="button" data-disk-view="tiles">Quadriculado</button>
+              </div>
+            </header>
+            <div class="sunburst" id="diskChart"></div>
+          </article>
+        </section>
+        <section class="grid">
+          <article class="panel panel--table">
+            <header>
+              <h2>Inspecionar</h2>
+              <p id="diskInspectHint">Escolha uma pasta na pizza ou na tabela</p>
+            </header>
+            <div class="disk-inspect-actions" id="diskInspectActions"></div>
+            <div class="table-wrap" id="diskInspect"></div>
+          </article>
+          <article class="panel">
+            <header>
+              <h2>Maiores pastas</h2>
+              <p>Ofensores em qualquer profundidade desta medição</p>
+            </header>
+            <div class="table-wrap" id="diskTop"></div>
+          </article>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <aside class="drawer" id="drawer" hidden>
+    <div class="drawer__panel" role="dialog" aria-labelledby="drawerTitle">
+      <header>
+        <p class="kicker" id="drawerSev"></p>
+        <h2 id="drawerTitle"></h2>
+        <button type="button" class="ghost" id="drawerClose">Fechar</button>
+      </header>
+      <dl class="facts" id="drawerFacts"></dl>
+      <section class="context" id="drawerContext"></section>
+      <section class="tips" id="drawerTips">
+        <header>
+          <h3>IA Tips</h3>
+          <button type="button" class="btn-ai" id="tipsRefresh">Pedir dicas</button>
+        </header>
+        <div id="tipsBody"></div>
+      </section>
+      <h3>Amostras do journal</h3>
+      <ol class="samples" id="drawerSamples"></ol>
+    </div>
+  </aside>
+
+  <div class="loading" id="loading" hidden>
+    <span class="loading__lamp"></span>
+    <p id="loadingText">Lendo o journal…</p>
+  </div>
+
+  <div class="modal" id="aiModal" hidden>
+    <div class="modal__panel" role="dialog" aria-labelledby="aiModalTitle">
+      <h2 id="aiModalTitle">Configurar IA Tips</h2>
+      <p id="aiModalLead">Cole uma chave do plano gratuito. Ela fica só neste computador e pode ser trocada a qualquer momento.</p>
+      <p class="modal__hint" id="aiCurrent" hidden></p>
+      <label>
+        Provedor
+        <select id="aiProvider">
+          <option value="groq">Groq (Llama, grátis)</option>
+          <option value="gemini">Google Gemini (grátis)</option>
+          <option value="openrouter">OpenRouter (modelos :free)</option>
+        </select>
+      </label>
+      <label>
+        Chave da API
+        <input id="aiKey" type="password" autocomplete="off" placeholder="Cole a chave nova aqui">
+      </label>
+      <p class="modal__hint" id="aiHint">Crie a chave em console.groq.com/keys</p>
+      <div class="modal__actions">
+        <button type="button" class="btn-ai" id="aiSave">Salvar e usar</button>
+        <button type="button" class="ghost" id="aiForget">Esquecer chave</button>
+        <button type="button" class="ghost" id="aiClose">Fechar</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="hostModal" hidden>
+    <div class="modal__panel modal__panel--wide" role="dialog" aria-labelledby="hostModalTitle">
+      <h2 id="hostModalTitle">Hosts da rede</h2>
+      <p>Instale o healthD em cada máquina (`--host 0.0.0.0`) e cadastre o ip:porta aqui. A lista fica neste computador.</p>
+      <label>
+        Nome desta máquina
+        <input id="hostLocalName" type="text" maxlength="40" placeholder="esta máquina" spellcheck="false">
+      </label>
+      <div class="modal__actions">
+        <button type="button" class="ghost" id="hostLocalSave">Salvar nome local</button>
+      </div>
+      <h3 class="host-modal-h">Remotos</h3>
+      <div id="hostRemoteList" class="host-manage-list"></div>
+      <label>
+        Nome
+        <input id="hostNewName" type="text" maxlength="40" placeholder="servidor-lab" spellcheck="false">
+      </label>
+      <label>
+        Endereço
+        <input id="hostNewAddr" type="text" placeholder="192.168.1.20:9999" spellcheck="false">
+      </label>
+      <p class="modal__hint" id="hostModalHint">Ex.: 10.0.0.12:9999 — a porta padrão é 9999.</p>
+      <div class="modal__actions">
+        <button type="button" class="btn-ai" id="hostAdd">Adicionar host</button>
+        <button type="button" class="ghost" id="hostModalClose">Fechar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/app.js?v=19"></script>
+</body>
+</html>
