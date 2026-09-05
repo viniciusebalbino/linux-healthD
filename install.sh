@@ -6,7 +6,7 @@ PREFIX=/usr/linux-healthd
 UNIT=/etc/systemd/system/healthd.service
 CONF=/etc/linux-healthd.conf
 STATE=/var/lib/healthd
-SERVICE_USER=healthd
+PAM=/etc/pam.d/healthd
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'erro: %s\n' "$*" >&2; exit 1; }
@@ -129,30 +129,40 @@ copy_tree() {
   find "$PREFIX" -type f -name '*.pyc' -delete 2>/dev/null || true
 }
 
-ensure_user() {
-  if id "$SERVICE_USER" >/dev/null 2>&1; then
-    :
-  elif command -v useradd >/dev/null 2>&1; then
-    useradd -r -M -d "$STATE" -s /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
-      || useradd -r -d "$STATE" -s /bin/false "$SERVICE_USER" \
-      || return 1
-  elif command -v adduser >/dev/null 2>&1; then
-    adduser -S -H -h "$STATE" -s /sbin/nologin "$SERVICE_USER" 2>/dev/null \
-      || adduser --system --no-create-home --home "$STATE" --shell /usr/sbin/nologin "$SERVICE_USER" \
-      || return 1
+ensure_group() {
+  if getent group healthd >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v groupadd >/dev/null 2>&1; then
+    groupadd -r healthd 2>/dev/null || groupadd healthd || return 1
+  elif command -v addgroup >/dev/null 2>&1; then
+    addgroup -S healthd 2>/dev/null || addgroup healthd || return 1
   else
     return 1
   fi
-  if getent group systemd-journal >/dev/null 2>&1; then
-    if command -v usermod >/dev/null 2>&1; then
-      usermod -aG systemd-journal "$SERVICE_USER" 2>/dev/null || true
-    elif command -v adduser >/dev/null 2>&1; then
-      adduser "$SERVICE_USER" systemd-journal 2>/dev/null || true
-    fi
+}
+
+write_pam() {
+  cat > "$PAM" <<'EOF'
+#%PAM-1.0
+auth       required     pam_unix.so
+account    required     pam_unix.so
+EOF
+  chmod 644 "$PAM"
+}
+
+grant_web_user() {
+  who=${SUDO_USER:-}
+  if [ -z "$who" ] || [ "$who" = "root" ]; then
+    log "libere o painel com: usermod -aG healthd SEU_USUARIO  (depois saia e entre na sessão)"
+    return
   fi
-  mkdir -p "$STATE"
-  chown -R "$SERVICE_USER:$SERVICE_USER" "$STATE" 2>/dev/null || chown -R "$SERVICE_USER" "$STATE" || true
-  return 0
+  if command -v usermod >/dev/null 2>&1; then
+    usermod -aG healthd "$who" 2>/dev/null || true
+  elif command -v adduser >/dev/null 2>&1; then
+    adduser "$who" healthd 2>/dev/null || true
+  fi
+  log "usuário $who no grupo healthd — saia e entre na sessão (ou newgrp healthd) para o login web valer"
 }
 
 write_run() {
@@ -161,7 +171,7 @@ write_run() {
 #!/bin/sh
 set -eu
 PREFIX=$PREFIX
-HOST=127.0.0.1
+HOST=0.0.0.0
 PORT=9999
 [ -f $CONF ] && . $CONF
 exec "$PYBIN" "\$PREFIX/healthd.py" --host "\${HEALTHD_HOST:-\$HOST}" --port "\${HEALTHD_PORT:-\$PORT}"
@@ -176,18 +186,15 @@ write_conf() {
   fi
   cat > "$CONF" <<'EOF'
 # healthD — altere e rode: systemctl restart healthd
-HEALTHD_HOST=127.0.0.1
+HEALTHD_HOST=0.0.0.0
 HEALTHD_PORT=9999
 EOF
   chmod 644 "$CONF"
 }
 
 write_unit() {
-  RUNUSER=$1
-  EXTRA_GROUP=
-  if [ "$RUNUSER" = "$SERVICE_USER" ] && getent group systemd-journal >/dev/null 2>&1; then
-    EXTRA_GROUP="SupplementaryGroups=systemd-journal"
-  fi
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
   cat > "$UNIT" <<EOF
 [Unit]
 Description=healthD — painel de saúde da máquina
@@ -196,15 +203,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$RUNUSER
-$EXTRA_GROUP
+User=root
 WorkingDirectory=$PREFIX
 Environment=HOME=$STATE
 Environment=XDG_CONFIG_HOME=$STATE/.config
 ExecStart=$PREFIX/run-healthd
 Restart=on-failure
 RestartSec=3
-NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -250,23 +255,16 @@ main() {
 
   write_run "$PYBIN"
   write_conf
-
-  RUNUSER=root
-  if ensure_user; then
-    RUNUSER=$SERVICE_USER
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$PREFIX" 2>/dev/null || chown -R "$SERVICE_USER" "$PREFIX" || true
-    log "serviço vai rodar como $SERVICE_USER"
-  else
-    log "não criou usuário $SERVICE_USER — serviço como root (acesso total ao journal)"
-  fi
-
-  write_unit "$RUNUSER"
+  write_pam
+  ensure_group || log "aviso: não criou o grupo healthd — crie-o antes de logar no painel"
+  grant_web_user
+  write_unit
   systemctl daemon-reload
   systemctl enable healthd.service
   systemctl start healthd.service
   if systemctl is-active --quiet healthd.service; then
     log "healthD instalado e ativo"
-    log "painel: http://127.0.0.1:9999  (host/porta em $CONF)"
+    log "painel: http://IP-DA-MAQUINA:9999  (login = usuário Linux no grupo healthd)"
     log "status: systemctl status healthd"
   else
     systemctl status healthd.service --no-pager -l || true

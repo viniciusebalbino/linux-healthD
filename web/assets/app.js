@@ -56,12 +56,23 @@ const $ = (id) => document.getElementById(id);
 
 function apiUrl(path) {
   const id = state.hostId || "local";
-  if (!path.startsWith("/api/") || path.startsWith("/api/hosts") || id === "local") return path;
+  if (!path.startsWith("/api/") || id === "local") return path;
+  if (
+    path.startsWith("/api/hosts")
+    || path.startsWith("/api/login")
+    || path.startsWith("/api/logout")
+    || path.startsWith("/api/session")
+  ) return path;
   return `/api/remote/${encodeURIComponent(id)}/${path.slice(5)}`;
 }
 
 function api(path, options) {
-  return fetch(apiUrl(path), options);
+  return fetch(apiUrl(path), { credentials: "same-origin", ...options }).then((res) => {
+    if (res.status === 401 && path !== "/api/login" && path !== "/api/session") {
+      window.location.replace("/login");
+    }
+    return res;
+  });
 }
 
 function fmtNum(n) {
@@ -266,7 +277,7 @@ function renderHostManageList() {
     <article class="host-manage-row" data-host-row="${escapeAttr(h.id)}">
       <div>
         <b>${escapeHtml(h.name)}</b>
-        <small>${escapeHtml(h.address)} · ${h.online ? "online" : (h.error || "offline")}${h.version ? ` · v${h.version}` : ""}</small>
+        <small>${escapeHtml(h.address)}${h.username ? ` · user ${h.username}` : ""} · ${h.online ? "online" : (h.error || "offline")}${h.version ? ` · v${h.version}` : ""}</small>
       </div>
       <div class="host-manage-actions">
         <button type="button" class="ghost" data-host-rename="${escapeAttr(h.id)}">Renomear</button>
@@ -278,7 +289,7 @@ function renderHostManageList() {
 
 async function loadHosts(probe = false) {
   try {
-    const res = await fetch(`/api/hosts${probe ? "?probe=1" : ""}`);
+    const res = await api(`/api/hosts${probe ? "?probe=1" : ""}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = await res.json();
     state.hostsLocal = payload.local;
@@ -302,9 +313,11 @@ function openHostModal() {
   $("hostLocalName").value = local.name || "";
   $("hostNewName").value = "";
   $("hostNewAddr").value = "";
+  $("hostNewUser").value = "";
+  $("hostNewPass").value = "";
   $("hostModalHint").textContent = local.listen
-    ? `Este painel escuta em ${local.listen}. Nas outras máquinas: python3 healthd.py --host 0.0.0.0`
-    : "Ex.: 10.0.0.12:9999 — a porta padrão é 9999.";
+    ? `Este painel escuta em ${local.listen}. No remoto: usuário Linux do grupo healthd.`
+    : "Nome, ip:porta, usuário e senha do Linux remoto (grupo healthd).";
   renderHostManageList();
   $("hostModal").hidden = false;
   $("hostNewName").focus();
@@ -313,17 +326,19 @@ function openHostModal() {
 async function addRemoteHost() {
   const name = $("hostNewName").value.trim();
   const address = $("hostNewAddr").value.trim();
+  const username = $("hostNewUser").value.trim();
+  const password = $("hostNewPass").value;
   const hint = $("hostModalHint");
-  if (!name || !address) {
-    hint.textContent = "Preencha o nome e o ip:porta.";
+  if (!name || !address || !username || !password) {
+    hint.textContent = "Preencha nome, ip:porta, usuário e senha do host remoto.";
     return;
   }
   hint.textContent = "Testando o host…";
   try {
-    const res = await fetch("/api/hosts", {
+    const res = await api("/api/hosts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, address }),
+      body: JSON.stringify({ name, address, username, password }),
     });
     const payload = await res.json();
     if (!res.ok || payload.error) {
@@ -334,7 +349,11 @@ async function addRemoteHost() {
     state.hosts = payload.hosts || [];
     $("hostNewName").value = "";
     $("hostNewAddr").value = "";
-    hint.textContent = "Host adicionado. Se estiver offline, confira o bind --host 0.0.0.0 e a porta.";
+    $("hostNewUser").value = "";
+    $("hostNewPass").value = "";
+    hint.textContent = payload.warning
+      ? payload.warning
+      : "Host adicionado. O login remoto precisa ser um usuário do grupo healthd.";
     paintHostBar();
   } catch (err) {
     hint.textContent = err.message;
@@ -342,7 +361,7 @@ async function addRemoteHost() {
 }
 
 async function renameHost(id, name) {
-  const res = await fetch("/api/hosts/rename", {
+    const res = await api("/api/hosts/rename", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id, name }),
@@ -359,7 +378,7 @@ async function renameHost(id, name) {
 
 async function removeHost(id) {
   if (!window.confirm("Remover este host da lista? O agente na máquina remota continua rodando.")) return;
-  const res = await fetch("/api/hosts/remove", {
+    const res = await api("/api/hosts/remove", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id }),
@@ -2523,6 +2542,12 @@ function bind() {
     if (ev.key === "Enter") $("hostNewAddr").focus();
   });
   $("hostNewAddr").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $("hostNewUser").focus();
+  });
+  $("hostNewUser").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $("hostNewPass").focus();
+  });
+  $("hostNewPass").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") addRemoteHost();
   });
   $("hostModalClose").addEventListener("click", () => { $("hostModal").hidden = true; });
@@ -2753,6 +2778,14 @@ function bind() {
   $("machineAi").addEventListener("click", (ev) => {
     if (ev.target.closest("[data-open-ai]")) openAiModal();
   });
+  $("logoutBtn").addEventListener("click", async () => {
+    try {
+      await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+    } catch {
+      /* still leave */
+    }
+    window.location.replace("/login");
+  });
   $("aiStatusBtn").addEventListener("click", openAiModal);
   $("aiClose").addEventListener("click", () => { $("aiModal").hidden = true; });
   $("aiModal").addEventListener("click", (ev) => {
@@ -2800,11 +2833,33 @@ function bind() {
   });
 }
 
-bind();
-loadHosts(true).then(() => {
-  loadAiStatus();
-  loadUnits();
-  loadReport();
+async function ensureSession() {
+  try {
+    const res = await fetch("/api/session", { credentials: "same-origin" });
+    const data = await res.json();
+    const btn = $("logoutBtn");
+    if (data.required && !data.user) {
+      window.location.replace("/login");
+      return false;
+    }
+    if (btn) {
+      btn.hidden = !data.required;
+      if (data.user) btn.title = data.user;
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+ensureSession().then((ok) => {
+  if (!ok) return;
+  bind();
+  loadHosts(true).then(() => {
+    loadAiStatus();
+    loadUnits();
+    loadReport();
+  });
 });
 setInterval(() => {
   if (state.tab === "journal") loadReport(true);

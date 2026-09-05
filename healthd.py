@@ -4,11 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import ctypes
+import ctypes.util
+import grp
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
+import pwd
 import re
+import secrets
 import shutil
 import socket
 import stat
@@ -20,13 +27,14 @@ import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "healthD"
-VERSION = "0.11.0"
+VERSION = "0.13.0"
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9999
@@ -35,6 +43,10 @@ CACHE_TTL_SEC = 12
 TIPS_TTL_SEC = 45 * 60
 CONFIG_DIR = Path.home() / ".config" / "healthd"
 LEGACY_CONFIG_DIR = Path.home() / ".config" / "journalctl-obs"
+AUTH_GROUP = "healthd"
+SESSION_TTL_SEC = 12 * 3600
+SESSION_COOKIE = "healthd_session"
+NOLOGIN_SHELLS = frozenset({"nologin", "false", "sync", "halt", "shutdown", ""})
 REMOTE_MAX_BYTES = 8_000_000
 REMOTE_HEALTH_TIMEOUT = 2.5
 GROQ_MODELS = ("openai/gpt-oss-20b", "qwen/qwen3.6-27b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b")
@@ -1609,6 +1621,190 @@ def clear_tips_cache() -> None:
         _tips_cache.clear()
 
 
+def auth_required() -> bool:
+    host = str((DashboardHandler.config or {}).get("bind_host") or DEFAULT_HOST).strip().lower()
+    return host not in {"127.0.0.1", "localhost", "::1", ""}
+
+
+def user_in_healthd_group(username: str) -> bool:
+    try:
+        grp_info = grp.getgrnam(AUTH_GROUP)
+    except KeyError:
+        return False
+    if username in grp_info.gr_mem:
+        return True
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        return False
+    return pw.pw_gid == grp_info.gr_gid
+
+
+def user_may_web_login(username: str) -> bool:
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        return False
+    shell = os.path.basename(pw.pw_shell or "").lstrip("-")
+    if shell in NOLOGIN_SHELLS:
+        return False
+    return user_in_healthd_group(username)
+
+
+def pam_service_name() -> str:
+    if Path("/etc/pam.d/healthd").is_file():
+        return "healthd"
+    if Path("/etc/pam.d/login").is_file():
+        return "login"
+    return "other"
+
+
+def pam_authenticate(username: str, password: str) -> bool:
+    libname = ctypes.util.find_library("pam") or "libpam.so.0"
+    try:
+        libpam = ctypes.CDLL(libname)
+    except OSError:
+        return False
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    try:
+        libc = ctypes.CDLL(libc_name)
+    except OSError:
+        return False
+    libc.calloc.restype = ctypes.c_void_p
+    libc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+    libc.strdup.restype = ctypes.c_void_p
+    libc.strdup.argtypes = [ctypes.c_char_p]
+
+    class PamHandle(ctypes.Structure):
+        _fields_ = [("handle", ctypes.c_void_p)]
+
+    class PamMessage(ctypes.Structure):
+        _fields_ = [("msg_style", ctypes.c_int), ("msg", ctypes.c_char_p)]
+
+    class PamResponse(ctypes.Structure):
+        _fields_ = [("resp", ctypes.c_char_p), ("resp_retcode", ctypes.c_int)]
+
+    conv_func = ctypes.CFUNCTYPE(
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.POINTER(PamMessage)),
+        ctypes.POINTER(ctypes.POINTER(PamResponse)),
+        ctypes.c_void_p,
+    )
+
+    class PamConv(ctypes.Structure):
+        _fields_ = [("conv", conv_func), ("appdata_ptr", ctypes.c_void_p)]
+
+    PAM_PROMPT_ECHO_OFF = 1
+    PAM_PROMPT_ECHO_ON = 2
+    password_bytes = password.encode("utf-8")
+    username_bytes = username.encode("utf-8")
+
+    @conv_func
+    def conv(n_msg, msg, resp, _appdata):
+        raw = libc.calloc(n_msg, ctypes.sizeof(PamResponse))
+        if not raw:
+            return 2
+        ptr = ctypes.cast(raw, ctypes.POINTER(PamResponse))
+        for i in range(n_msg):
+            style = msg[i].contents.msg_style
+            answer = b""
+            if style == PAM_PROMPT_ECHO_OFF:
+                answer = password_bytes
+            elif style == PAM_PROMPT_ECHO_ON:
+                answer = username_bytes
+            if answer:
+                dup = libc.strdup(answer)
+                ptr[i].resp = ctypes.cast(dup, ctypes.c_char_p) if dup else None
+            else:
+                ptr[i].resp = None
+            ptr[i].resp_retcode = 0
+        resp[0] = ptr
+        return 0
+
+    handle = PamHandle()
+    conversation = PamConv(conv, None)
+    libpam.pam_start.restype = ctypes.c_int
+    libpam.pam_start.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(PamConv), ctypes.POINTER(PamHandle)]
+    libpam.pam_authenticate.restype = ctypes.c_int
+    libpam.pam_acct_mgmt.restype = ctypes.c_int
+    libpam.pam_end.restype = ctypes.c_int
+    start = libpam.pam_start(pam_service_name().encode(), username.encode(), ctypes.byref(conversation), ctypes.byref(handle))
+    if start != 0:
+        return False
+    try:
+        if libpam.pam_authenticate(handle, 0) != 0:
+            return False
+        if libpam.pam_acct_mgmt(handle, 0) != 0:
+            return False
+        return True
+    finally:
+        libpam.pam_end(handle, 0)
+
+
+def authenticate_local(username: str, password: str) -> bool:
+    user = (username or "").strip()
+    if not user or password is None or password == "":
+        return False
+    if any(ch in user for ch in ":\n\r/\\") or len(user) > 64:
+        return False
+    if not user_may_web_login(user):
+        time.sleep(0.15)
+        return False
+    ok = pam_authenticate(user, password)
+    if not ok:
+        time.sleep(0.15)
+    return ok
+
+
+def session_secret() -> bytes:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path = CONFIG_DIR / "session.key"
+    if path.is_file():
+        data = path.read_bytes()
+        if len(data) >= 16:
+            return data
+    key = secrets.token_bytes(32)
+    path.write_bytes(key)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return key
+
+
+def issue_session(username: str) -> str:
+    exp = int(time.time()) + SESSION_TTL_SEC
+    payload = f"{username}:{exp}"
+    sig = hmac.new(session_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode("utf-8")).decode("ascii")
+
+
+def parse_session(token: str | None) -> str | None:
+    if not token:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        user, exp_s, sig = raw.rsplit(":", 2)
+        exp = int(exp_s)
+    except (ValueError, OSError):
+        return None
+    if exp < int(time.time()):
+        return None
+    payload = f"{user}:{exp}"
+    expect = hmac.new(session_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, sig):
+        return None
+    if not user_in_healthd_group(user):
+        return None
+    return user
+
+
+def basic_header(username: str, password: str) -> str:
+    blob = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return "Basic " + blob
+
+
 def load_hosts_config() -> dict[str, Any]:
     if config_file("hosts.json").is_file():
         try:
@@ -1626,6 +1822,8 @@ def load_hosts_config() -> dict[str, Any]:
                         "name": str(row.get("name") or "").strip()[:40],
                         "address": str(row.get("address") or "").strip()[:80],
                         "base": str(row.get("base") or "").strip()[:120],
+                        "username": str(row.get("username") or "").strip()[:64],
+                        "password": str(row.get("password") or ""),
                     })
                 return {
                     "local_name": str(data.get("local_name") or "").strip()[:40],
@@ -1645,6 +1843,8 @@ def save_hosts_config(data: dict[str, Any]) -> None:
                 "name": str(row.get("name") or "").strip()[:40],
                 "address": str(row.get("address") or "").strip()[:80],
                 "base": str(row.get("base") or "").strip()[:120],
+                "username": str(row.get("username") or "").strip()[:64],
+                "password": str(row.get("password") or ""),
             }
             for row in (data.get("hosts") or [])
             if RE_HOST_ID.match(str(row.get("id") or ""))
@@ -1717,8 +1917,15 @@ def _health_snapshot(host_id: str) -> dict[str, Any]:
     }
 
 
-def probe_remote_base(base: str, timeout: float = REMOTE_HEALTH_TIMEOUT) -> dict[str, Any]:
-    status, payload, err = remote_http("GET", base, "/api/health", "", b"", timeout=timeout)
+def probe_remote_base(
+    base: str,
+    timeout: float = REMOTE_HEALTH_TIMEOUT,
+    username: str = "",
+    password: str = "",
+) -> dict[str, Any]:
+    status, payload, err = remote_http(
+        "GET", base, "/api/health", "", b"", timeout=timeout, username=username, password=password
+    )
     if status == 200 and isinstance(payload, dict) and payload.get("ok"):
         return {"online": True, "version": payload.get("version"), "error": None}
     message = err or (payload.get("message") if isinstance(payload, dict) else None) or f"HTTP {status}"
@@ -1730,7 +1937,9 @@ def probe_all_remotes(hosts: list[dict[str, Any]]) -> None:
     results: dict[str, dict[str, Any]] = {}
 
     def work(row: dict[str, Any]) -> None:
-        results[row["id"]] = probe_remote_base(row["base"])
+        results[row["id"]] = probe_remote_base(
+            row["base"], username=str(row.get("username") or ""), password=str(row.get("password") or "")
+        )
 
     for row in hosts:
         if not row.get("base"):
@@ -1767,15 +1976,21 @@ def list_hosts_payload(probe: bool = False) -> dict[str, Any]:
             "name": row["name"] or row["address"],
             "address": row["address"],
             "kind": "remote",
+            "username": row.get("username") or "",
+            "has_auth": bool(row.get("username") and row.get("password")),
             **health,
         })
     return {"ok": True, "local": local_host_record(), "hosts": items}
 
 
-def add_remote_host(name: str, address: str) -> dict[str, Any]:
+def add_remote_host(name: str, address: str, username: str, password: str) -> dict[str, Any]:
     label = (name or "").strip()[:40]
+    user = (username or "").strip()[:64]
+    secret = str(password or "")
     if not label:
         return {"error": "missing_name", "message": "Dê um nome a este host."}
+    if not user or not secret:
+        return {"error": "missing_auth", "message": "Informe usuário e senha Linux daquela máquina (grupo healthd)."}
     try:
         display, base = parse_remote_address(address)
     except ValueError as exc:
@@ -1785,11 +2000,24 @@ def add_remote_host(name: str, address: str) -> dict[str, Any]:
         if row.get("base") == base or row.get("address") == display:
             return {"error": "duplicate", "message": "Este endereço já está na lista."}
     host_id = hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
-    cfg["hosts"].append({"id": host_id, "name": label, "address": display, "base": base})
+    cfg["hosts"].append({
+        "id": host_id,
+        "name": label,
+        "address": display,
+        "base": base,
+        "username": user,
+        "password": secret,
+    })
     save_hosts_config(cfg)
-    health = probe_remote_base(base)
+    health = probe_remote_base(base, username=user, password=secret)
     with _hosts_lock:
         _hosts_health[host_id] = {**health, "checked_at": iso(now_utc())}
+    if not health.get("online"):
+        return {
+            "ok": True,
+            "warning": health.get("error") or "Host salvo, mas o login remoto falhou.",
+            **list_hosts_payload(probe=False),
+        }
     return {"ok": True, **list_hosts_payload(probe=False)}
 
 
@@ -1856,6 +2084,8 @@ def remote_http(
     query: str,
     body: bytes,
     timeout: float = 20.0,
+    username: str = "",
+    password: str = "",
 ) -> tuple[int, dict[str, Any], str | None]:
     url = base.rstrip("/") + path
     if query:
@@ -1864,6 +2094,8 @@ def remote_http(
         "User-Agent": f"{APP_NAME}/{VERSION}",
         "Accept": "application/json",
     }
+    if username:
+        headers["Authorization"] = basic_header(username, password)
     data = body if body else None
     if data:
         headers["Content-Type"] = "application/json"
@@ -1895,6 +2127,11 @@ def remote_http(
             payload = {}
         if not payload:
             payload = {"error": "remote_http", "message": f"O host remoto respondeu HTTP {exc.code}."}
+        if exc.code == 401:
+            payload = {
+                "error": "auth",
+                "message": "Usuário/senha recusados no host remoto (precisa ser usuário local no grupo healthd).",
+            }
         return int(exc.code), payload, payload.get("message") or f"HTTP {exc.code}"
     except urllib.error.URLError as exc:
         reason = getattr(exc, "reason", exc)
@@ -4028,8 +4265,76 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+    def _is_public(self, path: str) -> bool:
+        if path in {"/login", "/login.html", "/api/login", "/api/logout", "/api/session"}:
+            return True
+        if path.startswith("/assets/app.css"):
+            return True
+        if path == "/favicon.ico":
+            return True
+        return False
+
+    def _cookie(self, name: str) -> str | None:
+        raw = self.headers.get("Cookie") or ""
+        jar = SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            return None
+        morsel = jar.get(name)
+        return morsel.value if morsel else None
+
+    def _current_user(self) -> str | None:
+        header = self.headers.get("Authorization") or ""
+        if header.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(header.split(None, 1)[1]).decode("utf-8")
+            except (ValueError, OSError, IndexError):
+                return None
+            user, sep, password = decoded.partition(":")
+            if not sep:
+                return None
+            return user.strip() if authenticate_local(user, password) else None
+        return parse_session(self._cookie(SESSION_COOKIE))
+
+    def _redirect(self, location: str, status: int = 302) -> None:
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _deny(self, parsed_path: str) -> None:
+        if parsed_path.startswith("/api/"):
+            self._send_json({"error": "auth", "message": "Faça login com um usuário local do grupo healthd."}, 401)
+            return
+        self._redirect("/login")
+
+    def _gate(self, parsed_path: str) -> bool:
+        if self._is_public(parsed_path):
+            return True
+        if not auth_required():
+            return True
+        if self._current_user():
+            return True
+        self._deny(parsed_path)
+        return False
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if not self._gate(parsed.path):
+            return
+        if parsed.path in {"/login", "/login.html"}:
+            self._send_static("/login.html")
+            return
+        if parsed.path == "/api/session":
+            user = self._current_user() if auth_required() else None
+            self._send_json({
+                "ok": True,
+                "required": auth_required(),
+                "user": user,
+                "group": AUTH_GROUP,
+            })
+            return
         remote = RE_REMOTE_API.fullmatch(parsed.path)
         if remote:
             self._proxy_remote("GET", remote.group(1), remote.group(2), parsed.query, b"")
@@ -4073,6 +4378,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
         raw = self._read_raw_body()
         if raw is None:
             return
+        if parsed.path == "/api/login":
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid_json"}, 400)
+                return
+            if not isinstance(body, dict):
+                self._send_json({"error": "invalid_json"}, 400)
+                return
+            user = str(body.get("username") or "")
+            password = str(body.get("password") or "")
+            if not auth_required():
+                self._send_json({"ok": True, "user": user or None, "required": False})
+                return
+            if not authenticate_local(user, password):
+                self._send_json(
+                    {"error": "auth", "message": "Usuário, senha ou grupo healthd inválidos."},
+                    401,
+                )
+                return
+            token = issue_session(user.strip())
+            cookie = f"{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL_SEC}; HttpOnly; SameSite=Lax"
+            self._send_json({"ok": True, "user": user.strip()}, 200, extra_headers=[("Set-Cookie", cookie)])
+            return
+        if parsed.path == "/api/logout":
+            cookie = f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+            self._send_json({"ok": True}, 200, extra_headers=[("Set-Cookie", cookie)])
+            return
+        if not self._gate(parsed.path):
+            return
         remote = RE_REMOTE_API.fullmatch(parsed.path)
         if remote:
             self._proxy_remote("POST", remote.group(1), remote.group(2), parsed.query, raw)
@@ -4086,7 +4421,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid_json"}, 400)
             return
         if parsed.path == "/api/hosts":
-            payload = add_remote_host(str(body.get("name") or ""), str(body.get("address") or ""))
+            payload = add_remote_host(
+                str(body.get("name") or ""),
+                str(body.get("address") or ""),
+                str(body.get("username") or ""),
+                str(body.get("password") or ""),
+            )
             self._send_json(payload, 400 if payload.get("error") else 200)
             return
         if parsed.path == "/api/hosts/rename":
@@ -4124,6 +4464,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if not self._gate(parsed.path):
+            return
         remote = RE_REMOTE_API.fullmatch(parsed.path)
         if remote:
             self._proxy_remote("DELETE", remote.group(1), remote.group(2), parsed.query, b"")
@@ -4171,6 +4513,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query,
             body,
             timeout=remote_timeout_for(suffix),
+            username=str(row.get("username") or ""),
+            password=str(row.get("password") or ""),
         )
         if err and suffix == "health":
             with _hosts_lock:
@@ -4188,7 +4532,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "error": None,
                     "checked_at": iso(now_utc()),
                 }
-        self._send_json(payload, status)
+        if not isinstance(payload, dict):
+            payload = {"error": "invalid_remote", "message": "Resposta remota inválida."}
+            status = 502
+        if status == 401:
+            self._send_json({
+                "error": "remote_auth",
+                "message": payload.get("message")
+                or "Usuário/senha recusados no host remoto (precisa ser usuário local no grupo healthd).",
+            }, 502)
+            return
+        self._send_json(payload, status if 100 <= status <= 599 else 502)
 
     def _save_ai(self, body: dict[str, Any]) -> None:
         api_key = str(body.get("api_key") or "").strip()
@@ -4353,12 +4707,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+    def _send_json(self, payload: dict[str, Any], status: int = 200, extra_headers: list[tuple[str, str]] | None = None) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        for key, value in extra_headers or []:
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -4407,8 +4763,15 @@ def main(argv: list[str] | None = None) -> int:
     url = f"http://{args.host}:{args.port}"
     print(f"{APP_NAME} {VERSION}")
     print(f"Dashboard: {url}")
-    if args.host in {"127.0.0.1", "localhost"}:
-        print("Na rede: nas outras máquinas use --host 0.0.0.0 e cadastre ip:porta em Hosts")
+    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+        print(f"Auth: obrigatória — usuários locais do grupo '{AUTH_GROUP}'")
+        if not Path("/etc/pam.d/healthd").is_file():
+            print("Aviso: /etc/pam.d/healthd ausente — rode o install.sh nesta máquina", file=sys.stderr)
+        if os.geteuid() != 0:
+            print(
+                "Aviso: sem root o PAM só autentica o próprio usuário deste processo",
+                file=sys.stderr,
+            )
     if args.demo:
         print("Modo demo: dados sintéticos")
     status = ai_status()
