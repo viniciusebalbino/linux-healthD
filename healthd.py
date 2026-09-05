@@ -21,6 +21,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -34,8 +35,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "healthD"
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 WEB_ROOT = Path(__file__).resolve().parent / "web"
+INSTALL_PREFIX = Path("/usr/linux-healthd")
+SYS_CONF_PATH = Path("/etc/linux-healthd.conf")
+DEFAULT_GIT_URL = "https://github.com/viniciusebalbino/linux-healthD.git"
+DEFAULT_GIT_BRANCH = "main"
+UPDATE_INTERVAL_SEC = 60 * 60
+UPDATE_FIRST_DELAY_SEC = 75
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9999
 DEFAULT_LINES = 80_000
@@ -120,13 +127,14 @@ RE_OOM_KILL = re.compile(r"Killed process (\d+) \(([^)]+)\)", re.I)
 RE_OOM_TASK = re.compile(r"\boom-kill:.*?\btask=(\S+)", re.I)
 RE_UNIT_SAFE = re.compile(r"^[A-Za-z0-9:_.@\\-]{1,256}$")
 RE_HOST_ID = re.compile(r"^[a-z0-9]{8,24}$")
+RE_PY_VERSION = re.compile(r'^VERSION\s*=\s*["\'](\d+\.\d+\.\d+)["\']', re.M)
 RE_DNS_NAME = re.compile(
     r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)$"
 )
 RE_REMOTE_API = re.compile(
     r"^/api/remote/([a-z0-9]{8,24})/"
     r"(health|report|ai(?:-chat)?|live|disk(?:/ls|/open)?|units|unit-logs|unit-tips|"
-    r"unit-disable|machine(?:-tips)?|tips)$"
+    r"unit-disable|machine(?:-tips)?|tips|update)$"
 )
 
 ESSENTIAL_UNIT_NAMES = frozenset(
@@ -2079,8 +2087,8 @@ def remote_timeout_for(suffix: str) -> float:
         return 4.0
     if suffix.startswith("disk"):
         return 90.0
-    if suffix in {"report", "machine", "machine-tips", "tips", "unit-tips", "ai-chat"}:
-        return 40.0
+    if suffix in {"report", "machine", "machine-tips", "tips", "unit-tips", "ai-chat", "update"}:
+        return 90.0 if suffix == "update" else 40.0
     return 20.0
 
 
@@ -4485,6 +4493,308 @@ def generate_machine_tips(body: dict[str, Any], demo: bool) -> dict[str, Any]:
     return payload
 
 
+def truthy_flag(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def read_sys_conf() -> dict[str, str]:
+    data: dict[str, str] = {}
+    if not SYS_CONF_PATH.is_file():
+        return data
+    try:
+        for line in SYS_CONF_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, _, val = text.partition("=")
+            data[key.strip()] = val.strip().strip("'\"")
+    except OSError:
+        return {}
+    return data
+
+
+def conf_or_env(name: str, default: str = "") -> str:
+    raw = os.environ.get(name)
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip()
+    return str(read_sys_conf().get(name) or default).strip()
+
+
+def parse_semver(text: str) -> tuple[int, int, int] | None:
+    parts = str(text or "").strip().split(".")
+    if len(parts) < 2 or len(parts) > 4:
+        return None
+    try:
+        nums = [int(p) for p in parts[:3]]
+    except ValueError:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return nums[0], nums[1], nums[2]
+
+
+def version_newer(remote: str, local: str) -> bool:
+    left = parse_semver(remote)
+    right = parse_semver(local)
+    if not left or not right:
+        return False
+    return left > right
+
+
+def extract_version_from_py(text: str) -> str | None:
+    match = RE_PY_VERSION.search(text or "")
+    return match.group(1) if match else None
+
+
+def http_get_text(url: str, timeout: int = 20) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": HTTP_UA, "Accept": "text/plain,*/*"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(250_000).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} ao consultar {url}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"sem rede para o GitHub: {exc.reason}") from exc
+
+
+def github_repo_path(url: str) -> str | None:
+    text = (url or "").strip()
+    if text.startswith("git@github.com:"):
+        text = "https://github.com/" + text.split(":", 1)[1]
+    text = text.rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    if "github.com/" not in text:
+        return None
+    return text.split("github.com/", 1)[1]
+
+
+def fetch_git_version(url: str, branch: str) -> tuple[str, str]:
+    path = github_repo_path(url)
+    if not path:
+        raise RuntimeError("HEALTHD_GIT_URL precisa ser um repositório GitHub")
+    last_error = "não achei VERSION no repositório"
+    for name in dict.fromkeys([branch, "main", "master"]):
+        raw = f"https://raw.githubusercontent.com/{path}/{name}/healthd.py"
+        try:
+            text = http_get_text(raw)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        found = extract_version_from_py(text)
+        if found:
+            return found, name
+    raise RuntimeError(last_error)
+
+
+def copy_update_tree(src: Path, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src / "healthd.py", dest / "healthd.py")
+    os.chmod(dest / "healthd.py", 0o755)
+    web_src = src / "web"
+    web_dest = dest / "web"
+    if not web_src.is_dir():
+        raise RuntimeError("o clone não trouxe a pasta web/")
+    staging = dest / ".web.next"
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(web_src, staging)
+    backup = dest / ".web.prev"
+    if backup.exists():
+        shutil.rmtree(backup)
+    if web_dest.exists():
+        web_dest.rename(backup)
+    staging.rename(web_dest)
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+    for name in ("README.md", "LICENSE", "install.sh", "requirements.txt"):
+        item = src / name
+        if item.is_file():
+            shutil.copy2(item, dest / name)
+    for path in dest.rglob("__pycache__"):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+class Updater:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: dict[str, Any] = {
+            "ok": True,
+            "running": VERSION,
+            "latest": None,
+            "newer": False,
+            "status": "idle",
+            "message": "",
+            "checked_at": None,
+            "installed": False,
+            "auto": False,
+            "can_apply": False,
+            "git_url": DEFAULT_GIT_URL,
+            "git_branch": DEFAULT_GIT_BRANCH,
+        }
+        self._busy = False
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._state)
+
+    def _set(self, **fields: Any) -> None:
+        with self._lock:
+            self._state.update(fields)
+            self._state["running"] = VERSION
+
+    def configure(self) -> None:
+        here = Path(__file__).resolve().parent
+        installed = here == INSTALL_PREFIX.resolve()
+        auto = truthy_flag(conf_or_env("HEALTHD_AUTO_UPDATE", "1" if installed else "0"))
+        can_apply = installed and os.access(here, os.W_OK)
+        url = conf_or_env("HEALTHD_GIT_URL", DEFAULT_GIT_URL) or DEFAULT_GIT_URL
+        branch = conf_or_env("HEALTHD_GIT_BRANCH", DEFAULT_GIT_BRANCH) or DEFAULT_GIT_BRANCH
+        with self._lock:
+            keep_branch = str(self._state.get("git_branch") or "")
+            self._state.update({
+                "installed": installed,
+                "auto": auto and can_apply,
+                "can_apply": can_apply,
+                "git_url": url,
+                "running": VERSION,
+                "git_branch": keep_branch or branch,
+            })
+
+    def start(self) -> None:
+        self.configure()
+        threading.Thread(target=self._loop, name="healthd-update", daemon=True).start()
+
+    def _loop(self) -> None:
+        time.sleep(UPDATE_FIRST_DELAY_SEC)
+        while True:
+            try:
+                self.check(apply=bool(self.snapshot().get("auto")))
+            except Exception as exc:
+                self._set(status="error", message=str(exc)[:180], checked_at=iso(now_utc()))
+            time.sleep(UPDATE_INTERVAL_SEC)
+
+    def check(self, apply: bool = False) -> dict[str, Any]:
+        self.configure()
+        snap = self.snapshot()
+        self._set(status="checking", message="consultando o GitHub…")
+        try:
+            latest, used_branch = fetch_git_version(str(snap["git_url"]), str(snap["git_branch"]))
+        except Exception as exc:
+            self._set(status="error", latest=None, newer=False, message=str(exc)[:180], checked_at=iso(now_utc()))
+            return self.snapshot()
+        newer = version_newer(latest, VERSION)
+        local = parse_semver(VERSION)
+        remote = parse_semver(latest)
+        if newer:
+            note = "há uma versão nova no git"
+            status = "available"
+        elif local and remote and local > remote:
+            note = "esta cópia está à frente do git"
+            status = "idle"
+        else:
+            note = "já está na última versão"
+            status = "idle"
+        self._set(
+            latest=latest,
+            newer=newer,
+            git_branch=used_branch,
+            status=status,
+            message=note,
+            checked_at=iso(now_utc()),
+        )
+        if apply and newer and snap.get("can_apply"):
+            return self.apply()
+        return self.snapshot()
+
+    def apply(self) -> dict[str, Any]:
+        snap = self.snapshot()
+        if not snap.get("can_apply"):
+            self._set(
+                status="error",
+                message="só atualiza sozinho a instalação em /usr/linux-healthd (serviço). Aqui rode sudo sh install.sh.",
+            )
+            return self.snapshot()
+        if shutil.which("git") is None:
+            self._set(status="error", message="git não está instalado nesta máquina.")
+            return self.snapshot()
+        with self._lock:
+            if self._busy:
+                return dict(self._state)
+            self._busy = True
+            self._state.update({"status": "updating", "message": "baixando o código no git…", "running": VERSION})
+        dest = INSTALL_PREFIX
+        tmp = Path(tempfile.mkdtemp(prefix="healthd-update-"))
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            clone = subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    str(snap["git_branch"]),
+                    str(snap["git_url"]),
+                    str(tmp / "src"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=env,
+            )
+            if clone.returncode != 0:
+                raise RuntimeError((clone.stderr or clone.stdout or "git clone falhou")[:180])
+            src = tmp / "src"
+            remote_ver = extract_version_from_py((src / "healthd.py").read_text(encoding="utf-8"))
+            if not remote_ver:
+                raise RuntimeError("clone sem VERSION em healthd.py")
+            if not version_newer(remote_ver, VERSION) and remote_ver != VERSION:
+                raise RuntimeError(f"versão remota inválida: {remote_ver}")
+            if not version_newer(remote_ver, VERSION):
+                self._set(status="idle", latest=remote_ver, newer=False, message="já está na última versão")
+                return self.snapshot()
+            copy_update_tree(src, dest)
+            self._set(
+                status="applied",
+                latest=remote_ver,
+                newer=False,
+                message=f"atualizado para {remote_ver}; reiniciando o serviço",
+                checked_at=iso(now_utc()),
+            )
+            out = self.snapshot()
+            out["restart"] = True
+            self.schedule_restart()
+            return out
+        except Exception as exc:
+            self._set(status="error", message=str(exc)[:180], checked_at=iso(now_utc()))
+            return self.snapshot()
+        finally:
+            with self._lock:
+                self._busy = False
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def schedule_restart(self) -> None:
+        def later() -> None:
+            time.sleep(1.2)
+            subprocess.Popen(
+                ["systemctl", "restart", "healthd"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        threading.Thread(target=later, name="healthd-restart", daemon=True).start()
+
+
+UPDATER = Updater()
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = f"{APP_NAME}/{VERSION}"
     config: dict[str, Any] = {}
@@ -4576,6 +4886,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/health":
             self._send_json({"ok": True, "version": VERSION})
+            return
+        if parsed.path == "/api/update":
+            self._send_json(UPDATER.snapshot())
             return
         if parsed.path == "/api/ai":
             self._send_json(ai_status())
@@ -4681,6 +4994,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/machine-tips":
             self._send_machine_tips(body)
+            return
+        if parsed.path == "/api/update":
+            if body.get("apply"):
+                payload = UPDATER.apply()
+            else:
+                payload = UPDATER.check(apply=False)
+            self._send_json(payload)
             return
         if parsed.path == "/api/ai":
             self._save_ai(body)
@@ -4999,6 +5319,7 @@ def main(argv: list[str] | None = None) -> int:
         "bind_port": args.port,
     }
     LIVE.start()
+    UPDATER.start()
     def warmup() -> None:
         try:
             get_report("24h", args.lines, args.user, args.demo)

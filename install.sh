@@ -174,6 +174,7 @@ PREFIX=$PREFIX
 HOST=0.0.0.0
 PORT=9999
 [ -f $CONF ] && . $CONF
+export HEALTHD_AUTO_UPDATE HEALTHD_GIT_URL HEALTHD_GIT_BRANCH
 exec "$PYBIN" "\$PREFIX/healthd.py" --host "\${HEALTHD_HOST:-\$HOST}" --port "\${HEALTHD_PORT:-\$PORT}"
 EOF
   chmod 755 "$PREFIX/run-healthd"
@@ -196,8 +197,18 @@ write_conf() {
 # healthD — altere e rode: systemctl restart healthd
 HEALTHD_HOST=0.0.0.0
 HEALTHD_PORT=9999
+HEALTHD_AUTO_UPDATE=1
+HEALTHD_GIT_URL=https://github.com/viniciusebalbino/linux-healthD.git
+HEALTHD_GIT_BRANCH=main
 EOF
   chmod 644 "$CONF"
+}
+
+ensure_conf_keys() {
+  [ -f "$CONF" ] || return 0
+  grep -q '^HEALTHD_AUTO_UPDATE=' "$CONF" || printf '\nHEALTHD_AUTO_UPDATE=1\n' >> "$CONF"
+  grep -q '^HEALTHD_GIT_URL=' "$CONF" || printf 'HEALTHD_GIT_URL=https://github.com/viniciusebalbino/linux-healthD.git\n' >> "$CONF"
+  grep -q '^HEALTHD_GIT_BRANCH=' "$CONF" || printf 'HEALTHD_GIT_BRANCH=main\n' >> "$CONF"
 }
 
 open_firewall() {
@@ -281,6 +292,7 @@ main() {
 
   write_run "$PYBIN"
   write_conf
+  ensure_conf_keys
   write_pam
   ensure_group || log "aviso: não criou o grupo healthd — crie-o antes de logar no painel"
   grant_web_user

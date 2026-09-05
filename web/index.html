@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/assets/app.css?v=21">
+  <link rel="stylesheet" href="/assets/app.css?v=22">
 </head>
 <body>
   <div class="noise" aria-hidden="true"></div>
@@ -99,6 +99,10 @@
           <div id="diskBeacons" class="beacons__list"></div>
         </section>
         <p class="rail__meta" id="diskMeta">ainda não medido</p>
+      </div>
+      <div class="rail__update" id="updateBox">
+        <p id="updateMeta">v0.15.0</p>
+        <button type="button" class="ghost" id="updateBtn" hidden>Atualizar agora</button>
       </div>
     </aside>
 
@@ -552,6 +556,6 @@
     </div>
   </div>
 
-  <script src="/assets/app.js?v=21"></script>
+  <script src="/assets/app.js?v=22"></script>
 </body>
 </html>

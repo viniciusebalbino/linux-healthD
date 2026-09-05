@@ -77,6 +77,8 @@ sudo usermod -aG healthd SEU_USUARIO
 systemctl status healthd
 ```
 
+O serviço instalado consulta o GitHub **a cada hora**. Se a `VERSION` do git for maior, faz `git clone` e troca `healthd.py`/`web/` em `/usr/linux-healthd` (não mexe no `.venv` nem no `hosts.json`). Depois o systemd reinicia o `healthd`. No painel, o canto da barra mostra se está em dia; dá para forçar **Atualizar agora**. Para desligar: `HEALTHD_AUTO_UPDATE=0` em `/etc/linux-healthd.conf`.
+
 ## Várias máquinas na rede
 
 Em cada computador da LAN, instale o serviço (`sudo sh install.sh`) para ele escutar em `0.0.0.0:9999` com autenticação. Em execução manual:

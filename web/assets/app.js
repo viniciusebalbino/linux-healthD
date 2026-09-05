@@ -215,6 +215,7 @@ function selectHost(id) {
   paintHostBar();
   resetHostData();
   loadAiStatus();
+  loadUpdate();
   reloadActiveView();
 }
 
@@ -1256,6 +1257,78 @@ function paintAiStatus() {
   } else {
     btn.textContent = "Configurar IA";
     btn.classList.remove("is-ready");
+  }
+}
+
+function paintUpdate(info) {
+  const meta = $("updateMeta");
+  const btn = $("updateBtn");
+  if (!meta || !btn) return;
+  state.update = info || state.update;
+  const u = state.update || {};
+  const running = u.running || "";
+  const latest = u.latest || "";
+  if (u.status === "checking") {
+    meta.textContent = `v${running} · conferindo git…`;
+    btn.hidden = true;
+    return;
+  }
+  if (u.status === "updating" || u.status === "applied") {
+    meta.textContent = u.message || `atualizando para v${latest}…`;
+    btn.hidden = true;
+    btn.disabled = true;
+    return;
+  }
+  if (u.newer && latest) {
+    meta.textContent = `v${running} · git tem v${latest}`;
+    btn.hidden = false;
+    btn.disabled = false;
+    btn.textContent = u.can_apply ? "Atualizar agora" : "Como atualizar";
+    return;
+  }
+  if (u.status === "error") {
+    meta.textContent = `v${running} · ${u.message || "falha ao checar git"}`;
+    btn.hidden = true;
+    return;
+  }
+  meta.textContent = latest ? `v${running} · em dia` : `v${running}`;
+  btn.hidden = true;
+}
+
+async function loadUpdate() {
+  try {
+    const res = await api("/api/update");
+    if (!res.ok) return;
+    paintUpdate(await res.json());
+  } catch {
+    /* ignore */
+  }
+}
+
+async function applyUpdate() {
+  const u = state.update || {};
+  const btn = $("updateBtn");
+  if (!u.newer) return;
+  if (!u.can_apply) {
+    window.alert("A atualização automática só roda no serviço instalado em /usr/linux-healthd.\n\nNesta pasta: puxe o git e rode sudo sh install.sh.");
+    return;
+  }
+  if (!window.confirm(`Baixar v${u.latest} do git e reiniciar o healthD neste host?`)) return;
+  if (btn) btn.disabled = true;
+  paintUpdate({ ...u, status: "updating", message: "baixando o código no git…" });
+  try {
+    const res = await api("/api/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apply: true }),
+    });
+    const data = await res.json();
+    paintUpdate(data);
+    if (data.restart) {
+      setTimeout(() => window.location.reload(), 4000);
+    }
+  } catch (err) {
+    paintUpdate({ ...u, status: "error", message: err.message });
   }
 }
 
@@ -2901,6 +2974,7 @@ function bind() {
     }
     window.location.replace("/login");
   });
+  $("updateBtn").addEventListener("click", applyUpdate);
   $("aiStatusBtn").addEventListener("click", openAiModal);
   $("aiClose").addEventListener("click", () => { $("aiModal").hidden = true; });
   $("aiModal").addEventListener("click", (ev) => {
@@ -2972,6 +3046,7 @@ ensureSession().then((ok) => {
   bind();
   loadHosts(true).then(() => {
     loadAiStatus();
+    loadUpdate();
     loadUnits();
     loadReport();
   });
@@ -2983,3 +3058,4 @@ unitTimer = setInterval(() => {
   if (state.tab === "services") loadUnits(true);
 }, 15000);
 setInterval(() => loadHosts(true), 20000);
+setInterval(() => loadUpdate(), 20000);
