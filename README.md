@@ -41,6 +41,23 @@ python3 healthd.py
 
 Abra [http://127.0.0.1:9999](http://127.0.0.1:9999).
 
+## Instalar no sistema (systemd)
+
+Na pasta do projeto (qualquer distro com systemd):
+
+```bash
+sudo sh install.sh
+```
+
+O script copia os arquivos para `/usr/linux-healthd/`, cria um env Python ali se a distro permitir (e instala `requirements.txt` via pip, se existir), registra o serviço **healthd**, dá `enable` e `start`.
+
+```bash
+systemctl status healthd
+# host/porta: /etc/linux-healthd.conf  →  systemctl restart healthd
+```
+
+O painel sobe em [http://127.0.0.1:9999](http://127.0.0.1:9999). Hoje o healthD não precisa de pip; o env isolado fica pronto para quando precisar.
+
 ```bash
 python3 healthd.py --help
 python3 healthd.py --user          # só o journal do usuário
