@@ -31,7 +31,7 @@ O painel usa a API da [Groq](https://console.groq.com/keys) no free tier (Llama,
 2. No dashboard, clique em **Configurar IA** e cole a chave  
    ou rode `python3 healthd.py --ai-provider groq --ai-key gsk_...`
 
-A chave fica em `~/.config/healthd/ai.json` (ainda lê a pasta antiga `~/.config/journalctl-obs/` se existir). Nada é enviado até você clicar em **IA Tips**.
+A chave fica em `~/.config/healthd/ai.json` (ainda lê a pasta antiga `~/.config/journalctl-obs/` se existir). Nada é enviado até você clicar em **IA Tips**. Depois da análise, o painel abre um chat no mesmo contexto: dá para perguntar, colar a saída de um comando e seguir o debug.
 
 ## Uso
 

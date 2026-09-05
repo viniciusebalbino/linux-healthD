@@ -41,6 +41,7 @@ const state = {
   hostsLocal: null,
   hosts: [],
   hostFilter: "",
+  chats: {},
 };
 
 const HOST_STORAGE = "healthd-host";
@@ -971,7 +972,94 @@ function paintUnitChrome(payload) {
   }
 }
 
-function formatTipsHtml(entry) {
+function rememberChat(key, threadId) {
+  if (!threadId) return;
+  const prev = state.chats[key];
+  if (!prev || prev.thread_id !== threadId) {
+    state.chats[key] = { thread_id: threadId, messages: [], pending: false, draft: "", error: "" };
+  }
+}
+
+function renderAiChat(key) {
+  const chat = state.chats[key];
+  if (!chat || !chat.thread_id) return "";
+  const log = (chat.messages || []).map((m) => `
+    <article class="ai-chat__msg is-${m.role === "user" ? "user" : "bot"}">
+      <small>${m.role === "user" ? "Você" : "IA"}</small>
+      <p>${escapeHtml(m.content || "").replaceAll("\n", "<br>")}</p>
+    </article>
+  `).join("");
+  const thinking = chat.pending
+    ? `<article class="ai-chat__msg is-bot"><small>IA</small><p>Pensando…</p></article>`
+    : "";
+  return `
+    <div class="ai-chat" data-chat-key="${escapeAttr(key)}">
+      <p class="ai-chat__lead">Pode continuar: pergunte, cole a saída de um comando, peça o próximo passo.</p>
+      <div class="ai-chat__log">${log}${thinking}</div>
+      ${chat.error ? `<p class="tips__caution">${escapeHtml(chat.error)}</p>` : ""}
+      <form class="ai-chat__form">
+        <textarea name="q" rows="2" maxlength="4000" placeholder="Ex.: rodei o journalctl e apareceu isto…" ${chat.pending ? "disabled" : ""}>${escapeHtml(chat.draft || "")}</textarea>
+        <button type="submit" class="btn-ai" ${chat.pending ? "disabled" : ""}>${chat.pending ? "Enviando…" : "Enviar"}</button>
+      </form>
+    </div>
+  `;
+}
+
+function refreshChatView(key) {
+  if (key.startsWith("issue:")) renderTips(key.slice(6));
+  else if (key.startsWith("unit:")) renderUnitAi();
+  else if (key === "machine") renderMachineAi();
+}
+
+async function sendAiChat(key) {
+  const chat = state.chats[key];
+  if (!chat || !chat.thread_id || chat.pending) return;
+  const box = document.querySelector(`.ai-chat[data-chat-key="${CSS.escape(key)}"] textarea`);
+  const text = (box ? box.value : chat.draft || "").trim();
+  if (!text) return;
+  chat.pending = true;
+  chat.error = "";
+  chat.draft = "";
+  chat.messages = [...(chat.messages || []), { role: "user", content: text }];
+  refreshChatView(key);
+  try {
+    const res = await api("/api/ai-chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: chat.thread_id, message: text }),
+    });
+    const data = await res.json();
+    if (res.status === 412 || data.error === "ai_not_configured") {
+      state.ai.configured = false;
+      paintAiStatus();
+      openAiModal();
+      chat.error = data.message || "IA não configurada.";
+      chat.messages.pop();
+    } else if (!res.ok || data.error) {
+      chat.error = data.message || "A IA não conseguiu responder.";
+      chat.messages.pop();
+    } else {
+      chat.messages = data.messages || [
+        ...chat.messages,
+        { role: "assistant", content: data.reply || "" },
+      ];
+    }
+  } catch (err) {
+    chat.error = err.message;
+    chat.messages.pop();
+  } finally {
+    chat.pending = false;
+    refreshChatView(key);
+    const ta = document.querySelector(`.ai-chat[data-chat-key="${CSS.escape(key)}"] textarea`);
+    if (ta) {
+      ta.focus();
+      const log = ta.closest(".ai-chat")?.querySelector(".ai-chat__log");
+      if (log) log.scrollTop = log.scrollHeight;
+    }
+  }
+}
+
+function formatTipsHtml(entry, chatKey) {
   if (!entry || entry.status === "loading") {
     return `<p class="tips__cause">Consultando a IA com o log de inicialização…</p>`;
   }
@@ -994,6 +1082,7 @@ function formatTipsHtml(entry) {
     ${cmds}
     ${t.caution ? `<p class="tips__caution"><strong>Cuidado.</strong> ${escapeHtml(t.caution)}</p>` : ""}
     <p class="tips__cause">${escapeHtml(entry.model || "")}</p>
+    ${entry.status === "ok" && entry.thread_id && chatKey ? renderAiChat(chatKey) : ""}
   `;
 }
 
@@ -1022,7 +1111,7 @@ function renderUnitAi() {
     </header>
     ${essentialNote}
     ${staticNote}
-    <div>${formatTipsHtml(entry)}</div>
+    <div>${formatTipsHtml(entry, unit ? `unit:${unit}` : "")}</div>
   `;
 }
 
@@ -1057,7 +1146,8 @@ async function requestUnitTips(refresh = false) {
     } else if (!res.ok || data.error) {
       state.unitTips[unit] = { status: "error", message: data.message || "A IA não conseguiu responder." };
     } else {
-      state.unitTips[unit] = { status: "ok", tips: data.tips, model: data.model };
+      state.unitTips[unit] = { status: "ok", tips: data.tips, model: data.model, thread_id: data.thread_id };
+      rememberChat(`unit:${unit}`, data.thread_id);
     }
   } catch (err) {
     if (seq !== unitTipSeq) return;
@@ -1226,6 +1316,7 @@ function renderTips(id) {
     ${cmds}
     ${t.caution ? `<p class="tips__caution"><strong>Cuidado.</strong> ${escapeHtml(t.caution)}</p>` : ""}
     <p class="tips__cause">${escapeHtml(entry.model || "")}</p>
+    ${entry.thread_id ? renderAiChat(`issue:${id}`) : ""}
   `;
 }
 
@@ -1258,7 +1349,8 @@ async function requestTips(id, refresh = false) {
     } else if (!res.ok || payload.error) {
       state.tips[id] = { status: "error", message: payload.message || "A IA não conseguiu responder." };
     } else {
-      state.tips[id] = { status: "ok", tips: payload.tips, model: payload.model };
+      state.tips[id] = { status: "ok", tips: payload.tips, model: payload.model, thread_id: payload.thread_id };
+      rememberChat(`issue:${id}`, payload.thread_id);
     }
   } catch (err) {
     state.tips[id] = { status: "error", message: err.message };
@@ -1720,6 +1812,7 @@ function renderMachineAi() {
     </div>
     ${t.caution ? `<p class="tips__caution"><strong>Cuidado.</strong> ${escapeHtml(t.caution)}</p>` : ""}
     <p class="tips__cause">${escapeHtml([t.provider, t.model].filter(Boolean).join(" · "))}</p>
+    ${entry.thread_id ? renderAiChat("machine") : ""}
   `;
 }
 
@@ -1751,7 +1844,8 @@ async function requestMachineTips(refresh = false) {
     } else if (!res.ok || data.error) {
       state.machineTips = { status: "error", message: data.message || "A IA não conseguiu responder." };
     } else {
-      state.machineTips = { status: "ok", tips: data };
+      state.machineTips = { status: "ok", tips: data, thread_id: data.thread_id, model: data.model, provider: data.provider };
+      rememberChat("machine", data.thread_id);
     }
   } catch (err) {
     if (seq !== machineTipSeq) return;
@@ -2773,6 +2867,27 @@ function bind() {
   });
   $("tipsBody").addEventListener("click", (ev) => {
     if (ev.target.closest("[data-open-ai]")) openAiModal();
+  });
+  document.addEventListener("submit", (ev) => {
+    const form = ev.target.closest(".ai-chat__form");
+    if (!form) return;
+    ev.preventDefault();
+    const box = form.closest(".ai-chat");
+    if (box?.dataset.chatKey) sendAiChat(box.dataset.chatKey);
+  });
+  document.addEventListener("input", (ev) => {
+    const ta = ev.target.closest?.(".ai-chat textarea");
+    if (!ta) return;
+    const key = ta.closest(".ai-chat")?.dataset.chatKey;
+    if (key && state.chats[key]) state.chats[key].draft = ta.value;
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.shiftKey) return;
+    const ta = ev.target.closest?.(".ai-chat textarea");
+    if (!ta) return;
+    ev.preventDefault();
+    const key = ta.closest(".ai-chat")?.dataset.chatKey;
+    if (key) sendAiChat(key);
   });
   $("machineTipsBtn").addEventListener("click", () => requestMachineTips(true));
   $("machineAi").addEventListener("click", (ev) => {

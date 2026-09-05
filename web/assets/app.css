@@ -530,6 +530,63 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.025); }
 }
 .cmd small { color: var(--muted); }
 
+.ai-chat {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+}
+.ai-chat__lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.ai-chat__log {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow: auto;
+  padding-right: 4px;
+}
+.ai-chat__msg {
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #0a0e13;
+}
+.ai-chat__msg small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.ai-chat__msg p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ai-chat__msg.is-user {
+  background: color-mix(in srgb, var(--info) 10%, #0a0e13);
+  border-color: color-mix(in srgb, var(--info) 28%, var(--line));
+}
+.ai-chat__msg.is-bot {
+  background: color-mix(in srgb, var(--ok) 8%, #0a0e13);
+}
+.ai-chat__form {
+  display: grid;
+  gap: 8px;
+}
+.ai-chat__form textarea {
+  min-height: 64px;
+  resize: vertical;
+}
+
 .modal {
   position: fixed;
   inset: 0;

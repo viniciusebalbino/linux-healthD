@@ -34,13 +34,16 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "healthD"
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9999
 DEFAULT_LINES = 80_000
 CACHE_TTL_SEC = 12
 TIPS_TTL_SEC = 45 * 60
+CHAT_TTL_SEC = 2 * 3600
+CHAT_MAX_FOLLOWUPS = 20
+CHAT_MAX_MESSAGE = 4000
 CONFIG_DIR = Path.home() / ".config" / "healthd"
 LEGACY_CONFIG_DIR = Path.home() / ".config" / "journalctl-obs"
 AUTH_GROUP = "healthd"
@@ -122,7 +125,7 @@ RE_DNS_NAME = re.compile(
 )
 RE_REMOTE_API = re.compile(
     r"^/api/remote/([a-z0-9]{8,24})/"
-    r"(health|report|ai|live|disk(?:/ls|/open)?|units|unit-logs|unit-tips|"
+    r"(health|report|ai(?:-chat)?|live|disk(?:/ls|/open)?|units|unit-logs|unit-tips|"
     r"unit-disable|machine(?:-tips)?|tips)$"
 )
 
@@ -184,6 +187,8 @@ _machine_lock = threading.Lock()
 _machine_cache: dict[str, Any] = {"expires": 0.0, "payload": None}
 _tips_lock = threading.Lock()
 _tips_cache: dict[str, dict[str, Any]] = {}
+_chat_lock = threading.Lock()
+_ai_chats: dict[str, dict[str, Any]] = {}
 _hosts_lock = threading.Lock()
 _hosts_health: dict[str, dict[str, Any]] = {}
 
@@ -1619,6 +1624,8 @@ def clear_ai_config() -> None:
 def clear_tips_cache() -> None:
     with _tips_lock:
         _tips_cache.clear()
+    with _chat_lock:
+        _ai_chats.clear()
 
 
 def auth_required() -> bool:
@@ -2072,7 +2079,7 @@ def remote_timeout_for(suffix: str) -> float:
         return 4.0
     if suffix.startswith("disk"):
         return 90.0
-    if suffix in {"report", "machine", "machine-tips", "tips", "unit-tips"}:
+    if suffix in {"report", "machine", "machine-tips", "tips", "unit-tips", "ai-chat"}:
         return 40.0
     return 20.0
 
@@ -2338,22 +2345,25 @@ def groq_discover_models(api_key: str) -> list[str]:
     return prefer + rest or list(GROQ_MODELS)
 
 
-def groq_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
+def groq_complete_messages(
+    api_key: str,
+    messages: list[dict[str, str]],
+    json_mode: bool = False,
+) -> tuple[str, str]:
     last_error: Exception | None = None
     models = groq_discover_models(api_key)
     for model in models:
+        body: dict[str, Any] = {
+            "model": model,
+            "temperature": 0.2 if json_mode else 0.3,
+            "messages": messages,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
         try:
             payload = http_json(
                 "https://api.groq.com/openai/v1/chat/completions",
-                {
-                    "model": model,
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                },
+                body,
                 {
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -2370,6 +2380,14 @@ def groq_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
             last_error = exc
             continue
     raise AiError(str(last_error) if last_error else "Groq não respondeu.")
+
+
+def groq_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
+    return groq_complete_messages(
+        api_key,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        json_mode=True,
+    )
 
 
 def gemini_discover_models(api_key: str) -> list[str]:
@@ -2395,17 +2413,29 @@ def gemini_discover_models(api_key: str) -> list[str]:
     return flash + [n for n in names if n not in flash]
 
 
-def gemini_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
+def gemini_complete_messages(
+    api_key: str,
+    system: str,
+    history: list[dict[str, str]],
+    json_mode: bool = False,
+) -> tuple[str, str]:
     last_error: Exception | None = None
     models = list(dict.fromkeys([*GEMINI_MODELS, *gemini_discover_models(api_key)]))
+    contents = []
+    for item in history:
+        role = "user" if item.get("role") == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": str(item.get("content") or "")}]})
+    gen: dict[str, Any] = {"temperature": 0.2 if json_mode else 0.3}
+    if json_mode:
+        gen["responseMimeType"] = "application/json"
     for model in models:
         try:
             payload = http_json(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
                 {
                     "systemInstruction": {"parts": [{"text": system}]},
-                    "contents": [{"role": "user", "parts": [{"text": user}]}],
-                    "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+                    "contents": contents,
+                    "generationConfig": gen,
                 },
                 {"Content-Type": "application/json", "x-goog-api-key": api_key},
             )
@@ -2424,16 +2454,17 @@ def gemini_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
     )
 
 
-def openrouter_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
+def gemini_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
+    return gemini_complete_messages(api_key, system, [{"role": "user", "content": user}], json_mode=True)
+
+
+def openrouter_complete_messages(api_key: str, messages: list[dict[str, str]], json_mode: bool = False) -> tuple[str, str]:
     payload = http_json(
         "https://openrouter.ai/api/v1/chat/completions",
         {
             "model": OPENROUTER_MODEL,
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "temperature": 0.2 if json_mode else 0.3,
+            "messages": messages,
         },
         {
             "Authorization": f"Bearer {api_key}",
@@ -2444,6 +2475,14 @@ def openrouter_complete(api_key: str, system: str, user: str) -> tuple[str, str]
     )
     text = payload["choices"][0]["message"]["content"]
     return text, f"openrouter/{OPENROUTER_MODEL}"
+
+
+def openrouter_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
+    return openrouter_complete_messages(
+        api_key,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        json_mode=True,
+    )
 
 
 def complete_ai(provider: str, api_key: str, system: str, user: str) -> tuple[str, str, str]:
@@ -2457,6 +2496,188 @@ def complete_ai(provider: str, api_key: str, system: str, user: str) -> tuple[st
     return text, model, provider
 
 
+def complete_chat(
+    provider: str,
+    api_key: str,
+    system: str,
+    history: list[dict[str, str]],
+) -> tuple[str, str, str]:
+    if provider == "gemini":
+        text, model = gemini_complete_messages(api_key, system, history, json_mode=False)
+    elif provider == "openrouter":
+        text, model = openrouter_complete_messages(
+            api_key,
+            [{"role": "system", "content": system}, *history],
+            json_mode=False,
+        )
+    else:
+        text, model = groq_complete_messages(
+            api_key,
+            [{"role": "system", "content": system}, *history],
+            json_mode=False,
+        )
+        provider = "groq"
+    return text, model, provider
+
+
+CHAT_SYSTEM = (
+    "Você é um SRE Linux conversando com o dono desta máquina no painel healthD. "
+    "Já existe uma análise inicial neste histórico. Continue o debug em português do Brasil. "
+    "Faça perguntas objetivas se faltar dado. Peça para colar a saída de um comando quando isso ajudar. "
+    "Não peça senhas, chaves nem exploits. Prefira comandos somente leitura. "
+    "Marque qualquer passo que reinicie serviço ou altere configuração. "
+    "Responda em texto corrido (não JSON), curto e prático."
+)
+
+
+def format_tips_for_chat(tips: dict[str, Any]) -> str:
+    lines: list[str] = []
+    if tips.get("summary"):
+        lines.append(str(tips["summary"]).strip())
+    if tips.get("likely_cause"):
+        lines.append("Causa provável: " + str(tips["likely_cause"]).strip())
+    for index, step in enumerate(tips.get("steps") or [], 1):
+        if str(step).strip():
+            lines.append(f"{index}. {step}")
+    for cmd in tips.get("commands") or []:
+        if isinstance(cmd, dict) and cmd.get("cmd"):
+            why = f" — {cmd['why']}" if cmd.get("why") else ""
+            lines.append(f"$ {cmd['cmd']}{why}")
+        elif cmd:
+            lines.append(f"$ {cmd}")
+    if tips.get("caution"):
+        lines.append("Cuidado: " + str(tips["caution"]).strip())
+    return "\n".join(lines) or "Análise inicial pronta. Pode perguntar para continuar o debug."
+
+
+def format_machine_for_chat(payload: dict[str, Any]) -> str:
+    lines: list[str] = []
+    if payload.get("summary"):
+        lines.append(str(payload["summary"]).strip())
+    for item in payload.get("software") or []:
+        if isinstance(item, dict) and item.get("title"):
+            lines.append("Software: " + str(item["title"]))
+            if item.get("why"):
+                lines.append("  " + str(item["why"]))
+    for item in payload.get("hardware") or []:
+        if isinstance(item, dict) and item.get("title"):
+            lines.append("Hardware: " + str(item["title"]))
+            if item.get("why"):
+                lines.append("  " + str(item["why"]))
+    if payload.get("caution"):
+        lines.append("Cuidado: " + str(payload["caution"]).strip())
+    return "\n".join(lines) or "Análise da máquina pronta. Pode perguntar para continuar."
+
+
+def prune_ai_chats(now: float | None = None) -> None:
+    stamp = time.time() if now is None else now
+    dead = [key for key, row in _ai_chats.items() if float(row.get("expires") or 0) < stamp]
+    for key in dead:
+        _ai_chats.pop(key, None)
+    if len(_ai_chats) <= 48:
+        return
+    oldest = sorted(_ai_chats.items(), key=lambda item: float(item[1].get("expires") or 0))
+    for key, _ in oldest[: len(_ai_chats) - 40]:
+        _ai_chats.pop(key, None)
+
+
+def visible_chat_messages(thread: dict[str, Any]) -> list[dict[str, str]]:
+    messages = thread.get("messages") or []
+    follow = messages[2:] if len(messages) >= 2 else messages
+    out = []
+    for item in follow:
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        out.append({"role": role, "content": str(item.get("content") or "")})
+    return out
+
+
+def remember_chat_thread(kind: str, context_user: str, assistant_text: str) -> str:
+    now = time.time()
+    with _chat_lock:
+        prune_ai_chats(now)
+        thread_id = secrets.token_hex(8)
+        _ai_chats[thread_id] = {
+            "id": thread_id,
+            "kind": kind,
+            "expires": now + CHAT_TTL_SEC,
+            "system": CHAT_SYSTEM,
+            "messages": [
+                {"role": "user", "content": context_user},
+                {"role": "assistant", "content": assistant_text},
+            ],
+        }
+        return thread_id
+
+
+def attach_chat_thread(payload: dict[str, Any], kind: str, context_user: str, assistant_text: str) -> dict[str, Any]:
+    old = str(payload.get("thread_id") or "")
+    with _chat_lock:
+        prune_ai_chats()
+        if old and old in _ai_chats:
+            payload["thread_id"] = old
+            return payload
+    payload["thread_id"] = remember_chat_thread(kind, context_user, assistant_text)
+    return payload
+
+
+def continue_ai_chat(body: dict[str, Any]) -> dict[str, Any]:
+    provider, api_key = resolve_ai(body)
+    if not api_key:
+        return {
+            "error": "ai_not_configured",
+            "message": "Configure uma chave gratuita para continuar a conversa.",
+            "status": ai_status(),
+        }
+    thread_id = str(body.get("thread_id") or "").strip()
+    message = str(body.get("message") or "").strip()[:CHAT_MAX_MESSAGE]
+    if not thread_id or not re.fullmatch(r"[a-f0-9]{16}", thread_id):
+        return {"error": "chat_missing", "message": "Conversa não encontrada. Peça as dicas outra vez."}
+    with _chat_lock:
+        prune_ai_chats()
+        thread = _ai_chats.get(thread_id)
+        if not thread:
+            return {"error": "chat_expired", "message": "A conversa expirou. Peça as dicas de novo para reabrir o chat."}
+        history = list(thread.get("messages") or [])
+        followups = [row for row in history[2:] if row.get("role") == "user"]
+        if len(followups) >= CHAT_MAX_FOLLOWUPS:
+            return {
+                "error": "chat_limit",
+                "message": "Esta conversa ficou longa. Peça as dicas de novo para começar outra.",
+                "thread_id": thread_id,
+                "messages": visible_chat_messages(thread),
+            }
+        if not message:
+            return {
+                "ok": True,
+                "thread_id": thread_id,
+                "messages": visible_chat_messages(thread),
+            }
+        history.append({"role": "user", "content": message})
+        seed, rest = history[:2], history[2:]
+        if len(rest) > CHAT_MAX_FOLLOWUPS * 2:
+            rest = rest[-(CHAT_MAX_FOLLOWUPS * 2) :]
+        send = seed + rest
+        system = str(thread.get("system") or CHAT_SYSTEM)
+    text, model, provider = complete_chat(provider, api_key, system, send)
+    reply = str(text or "").strip()
+    with _chat_lock:
+        live = _ai_chats.get(thread_id)
+        if not live:
+            return {"error": "chat_expired", "message": "A conversa expirou no meio da resposta."}
+        live["messages"] = send + [{"role": "assistant", "content": reply}]
+        live["expires"] = time.time() + CHAT_TTL_SEC
+        return {
+            "ok": True,
+            "thread_id": thread_id,
+            "reply": reply,
+            "model": model,
+            "provider": provider,
+            "messages": visible_chat_messages(live),
+        }
+
+
 def generate_tips(issue: dict[str, Any], report: dict[str, Any] | None, body: dict[str, Any]) -> dict[str, Any]:
     provider, api_key = resolve_ai(body)
     if not api_key:
@@ -2467,12 +2688,13 @@ def generate_tips(issue: dict[str, Any], report: dict[str, Any] | None, body: di
         }
     cache_key = str(issue.get("id") or hashlib.sha1(str(issue.get("title")).encode()).hexdigest()[:16])
     now = time.time()
+    system, user = build_tips_prompt(issue, report)
     with _tips_lock:
         cached = _tips_cache.get(cache_key)
         if cached and cached["expires"] > now and not body.get("refresh"):
-            return cached["payload"]
+            payload = dict(cached["payload"])
+            return attach_chat_thread(payload, "issue", user, format_tips_for_chat(payload.get("tips") or {}))
 
-    system, user = build_tips_prompt(issue, report)
     text, model, provider = complete_ai(provider, api_key, system, user)
 
     tips = parse_model_json(text)
@@ -2483,6 +2705,7 @@ def generate_tips(issue: dict[str, Any], report: dict[str, Any] | None, body: di
         "issue_id": cache_key,
         "tips": tips,
     }
+    payload = attach_chat_thread(payload, "issue", user, format_tips_for_chat(tips))
     with _tips_lock:
         _tips_cache[cache_key] = {"expires": now + TIPS_TTL_SEC, "payload": payload}
     return payload
@@ -2552,11 +2775,12 @@ def generate_unit_tips(
     tail = "|".join(str((row.get("message") or "")[:80]) for row in (logs.get("entries") or [])[-8:])
     cache_key = "unit:" + hashlib.sha1(f"{unit}|{logs.get('status', {}).get('result')}|{tail}".encode()).hexdigest()[:20]
     now = time.time()
+    system, user = build_unit_tips_prompt(unit, logs)
     with _tips_lock:
         cached = _tips_cache.get(cache_key)
         if cached and cached["expires"] > now and not body.get("refresh"):
-            return cached["payload"]
-    system, user = build_unit_tips_prompt(unit, logs)
+            payload = dict(cached["payload"])
+            return attach_chat_thread(payload, "unit", user, format_tips_for_chat(payload.get("tips") or {}))
     text, model, provider = complete_ai(provider, api_key, system, user)
     tips = parse_model_json(text)
     payload = {
@@ -2569,6 +2793,7 @@ def generate_unit_tips(
         "can_disable": bool(logs.get("can_disable")),
         "tips": tips,
     }
+    payload = attach_chat_thread(payload, "unit", user, format_tips_for_chat(tips))
     with _tips_lock:
         _tips_cache[cache_key] = {"expires": now + TIPS_TTL_SEC, "payload": payload}
     return payload
@@ -4176,10 +4401,6 @@ def generate_machine_tips(body: dict[str, Any], demo: bool) -> dict[str, Any]:
         ).encode()
     ).hexdigest()[:20]
     now = time.time()
-    with _tips_lock:
-        cached = _tips_cache.get(cache_key)
-        if cached and cached["expires"] > now and not body.get("refresh"):
-            return cached["payload"]
     system = (
         "Você é um SRE Linux e consultor de hardware analisando ESTA máquina do usuário. "
         "Responda em português do Brasil. "
@@ -4198,6 +4419,11 @@ def generate_machine_tips(body: dict[str, Any], demo: bool) -> dict[str, Any]:
     user = "Analise esta máquina e proponha melhorias de software e, se fizer sentido, de hardware:\n" + json.dumps(
         context, ensure_ascii=False, indent=2
     )
+    with _tips_lock:
+        cached = _tips_cache.get(cache_key)
+        if cached and cached["expires"] > now and not body.get("refresh"):
+            payload = dict(cached["payload"])
+            return attach_chat_thread(payload, "machine", user, format_machine_for_chat(payload))
     text, model, provider = complete_ai(provider, api_key, system, user)
     parsed = parse_model_json(text)
     software = []
@@ -4253,6 +4479,7 @@ def generate_machine_tips(body: dict[str, Any], demo: bool) -> dict[str, Any]:
         "ai_bottlenecks": ai_bottlenecks[:8],
         "score": report.get("score"),
     }
+    payload = attach_chat_thread(payload, "machine", user, format_machine_for_chat(payload))
     with _tips_lock:
         _tips_cache[cache_key] = {"expires": now + TIPS_TTL_SEC, "payload": payload}
     return payload
@@ -4443,6 +4670,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tips":
             self._send_tips(body)
             return
+        if parsed.path == "/api/ai-chat":
+            self._send_ai_chat(body)
+            return
         if parsed.path == "/api/unit-tips":
             self._send_unit_tips(body)
             return
@@ -4561,6 +4791,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         save_ai_config(provider, api_key)
         clear_tips_cache()
         self._send_json(ai_status())
+
+    def _send_ai_chat(self, body: dict[str, Any]) -> None:
+        try:
+            payload = continue_ai_chat(body)
+        except AiError as exc:
+            self._send_json({"error": "ai_failed", "message": str(exc)}, 502)
+            return
+        except Exception as exc:
+            self._send_json({"error": "ai_failed", "message": str(exc)}, 502)
+            return
+        if payload.get("error") == "ai_not_configured":
+            self._send_json(payload, 412)
+            return
+        if payload.get("error"):
+            self._send_json(payload, 400)
+            return
+        self._send_json(payload)
 
     def _send_tips(self, body: dict[str, Any]) -> None:
         issue = body.get("issue")
