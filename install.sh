@@ -181,7 +181,15 @@ EOF
 
 write_conf() {
   if [ -f "$CONF" ]; then
-    log "mantendo $CONF"
+    current=$(grep '^HEALTHD_HOST=' "$CONF" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '[:space:]')
+    if [ "$current" = "127.0.0.1" ] || [ "$current" = "localhost" ] || [ "$current" = "::1" ]; then
+      tmp=$(mktemp)
+      sed 's/^HEALTHD_HOST=.*/HEALTHD_HOST=0.0.0.0/' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+      chmod 644 "$CONF"
+      log "atualizando $CONF para HEALTHD_HOST=0.0.0.0 (login obrigatório na LAN)"
+    else
+      log "mantendo $CONF"
+    fi
     return
   fi
   cat > "$CONF" <<'EOF'
