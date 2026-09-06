@@ -35,7 +35,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "healthD"
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 INSTALL_PREFIX = Path("/usr/linux-healthd")
 SYS_CONF_PATH = Path("/etc/linux-healthd.conf")

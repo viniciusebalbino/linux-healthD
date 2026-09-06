@@ -92,6 +92,19 @@ function fmtTime(iso) {
   return d.toLocaleString("pt-BR", { hour12: false });
 }
 
+function svgLegend(items, y, startX) {
+  let x = startX;
+  return items.map((it) => {
+    const label = String(it.label);
+    const g = `<g>
+      <circle cx="${x}" cy="${y - 4}" r="3.5" fill="${it.color}"/>
+      <text x="${x + 10}" y="${y}" fill="#8d9aab" font-size="11">${label}</text>
+    </g>`;
+    x += 22 + Math.max(36, label.length * 6.8);
+    return g;
+  }).join("");
+}
+
 function relative(iso) {
   if (!iso) return "—";
   const diff = Date.now() - new Date(iso).getTime();
@@ -519,8 +532,8 @@ function renderTimeline(points) {
   }
   const keys = ["emerg", "alert", "crit", "err", "warning"];
   const w = 900;
-  const h = 200;
-  const pad = { l: 28, r: 12, t: 16, b: 28 };
+  const h = 220;
+  const pad = { l: 28, r: 12, t: 36, b: 28 };
   const totals = points.map((p) => keys.reduce((acc, k) => acc + (p.counts[k] || 0), 0));
   const max = Math.max(1, ...totals);
   const innerW = w - pad.l - pad.r;
@@ -547,10 +560,8 @@ function renderTimeline(points) {
       ${bars}
       <text x="${pad.l}" y="${h - 8}" fill="#8d9aab" font-size="11">${first}</text>
       <text x="${w - pad.r}" y="${h - 8}" fill="#8d9aab" font-size="11" text-anchor="end">${last}</text>
+      ${svgLegend(keys.map((k) => ({ color: SEV_COLOR[k], label: k })), 20, pad.l)}
     </svg>
-    <div class="legend">
-      ${keys.map((k) => `<span><i style="background:${SEV_COLOR[k]}"></i>${k}</span>`).join("")}
-    </div>
   `;
 }
 
@@ -1465,8 +1476,8 @@ function renderLineChart(id, points, series, opts = {}) {
     return;
   }
   const w = 900;
-  const h = 200;
-  const pad = { l: 52, r: 12, t: 16, b: 28 };
+  const h = 220;
+  const pad = { l: 52, r: 12, t: 36, b: 28 };
   const fmt = opts.fmt || ((n) => n.toLocaleString("pt-BR", { maximumFractionDigits: 1 }));
   const max = Math.max(opts.minMax || 1, ...series.flatMap((s) => points.map((p) => Number(p[s.key]) || 0)));
   const innerH = h - pad.t - pad.b;
@@ -1481,10 +1492,8 @@ function renderLineChart(id, points, series, opts = {}) {
       ${lines}
       <text x="${pad.l}" y="${h - 8}" fill="#8d9aab" font-size="11">${fmtTime(points[0].t)}</text>
       <text x="${w - pad.r}" y="${h - 8}" fill="#8d9aab" font-size="11" text-anchor="end">${fmtTime(points[points.length - 1].t)}</text>
+      ${svgLegend(series.map((s) => ({ color: s.color, label: s.label })), 20, pad.l)}
     </svg>
-    <div class="legend">
-      ${series.map((s) => `<span><i style="background:${s.color}"></i>${s.label}</span>`).join("")}
-    </div>
   `;
 }
 

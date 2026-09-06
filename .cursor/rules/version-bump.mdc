@@ -1,0 +1,16 @@
+---
+description: Sempre subir VERSION a cada commit para o auto-update das máquinas instaladas.
+alwaysApply: true
+---
+
+# Versão do healthD
+
+Máquinas com o serviço instalado só mostram **Atualizar agora** quando a `VERSION` no git é maior que a que está rodando. Sem bump, a correção não chega nelas.
+
+Antes de cada commit:
+
+1. Subir `VERSION` em `healthd.py` (semver: patch para correção, minor para feature).
+2. Espelhar o placeholder em `web/index.html` (`#updateMeta`, ex. `v0.15.1`).
+3. Não reutilizar o número de um commit já publicado.
+
+Não commitar sem esse bump.
