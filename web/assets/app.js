@@ -51,6 +51,24 @@ const AI_SIGNUP = {
   groq: "https://console.groq.com/keys",
   gemini: "https://aistudio.google.com/apikey",
   openrouter: "https://openrouter.ai/keys",
+  claude: "https://console.anthropic.com/settings/keys",
+  "claude-code": "https://code.claude.com/docs/en/quickstart",
+};
+
+const AI_HINT = {
+  groq: "Crie a chave em https://console.groq.com/keys",
+  gemini: "Crie a chave em https://aistudio.google.com/apikey",
+  openrouter: "Crie a chave em https://openrouter.ai/keys",
+  claude: "Crie a chave em https://console.anthropic.com/settings/keys (sk-ant-…)",
+  "claude-code": "Usa o CLI `claude` já logado neste computador. Não precisa de chave. Se o healthD roda como serviço root, o login precisa estar em /root — nesse caso use Claude (API).",
+};
+
+const AI_LABEL = {
+  groq: "groq",
+  gemini: "gemini",
+  openrouter: "openrouter",
+  claude: "claude",
+  "claude-code": "claude code",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1263,7 +1281,7 @@ function paintAiStatus() {
   const btn = $("aiStatusBtn");
   if (!btn) return;
   if (state.ai.configured) {
-    btn.textContent = `IA · ${state.ai.provider} · trocar`;
+    btn.textContent = `IA · ${AI_LABEL[state.ai.provider] || state.ai.provider} · trocar`;
     btn.classList.add("is-ready");
   } else {
     btn.textContent = "Configurar IA";
@@ -1343,27 +1361,36 @@ async function applyUpdate() {
   }
 }
 
+function syncAiProviderUi() {
+  const p = $("aiProvider").value;
+  const needsKey = p !== "claude-code";
+  $("aiKeyRow").hidden = !needsKey;
+  $("aiHint").textContent = AI_HINT[p] || AI_HINT.groq;
+}
+
 function openAiModal() {
   const configured = Boolean(state.ai.configured && state.ai.provider);
-  $("aiModalTitle").textContent = configured ? "Trocar chave da IA" : "Configurar IA Tips";
+  $("aiModalTitle").textContent = configured ? "Trocar provedor da IA" : "Configurar IA Tips";
   $("aiModalLead").textContent = configured
-    ? "Cole uma chave nova para substituir a atual. O provedor é detectado pelo prefixo (gsk_ = Groq, AIza = Gemini)."
-    : "Cole uma chave do plano gratuito. Ela fica no host selecionado e pode ser trocada a qualquer momento.";
+    ? "Troque o provedor ou cole uma chave nova. Groq/Gemini/OpenRouter/Claude usam chave; Claude Code usa o CLI local."
+    : "Escolha o provedor. Groq, Gemini, OpenRouter e Claude pedem chave; Claude Code usa o `claude` já logado neste host.";
   const host = currentHost();
   if (host && host.id !== "local") {
     $("aiModalLead").textContent = configured
-      ? `A chave nova substitui a do host “${host.name}” (${host.address}).`
-      : `Cole uma chave para o host “${host.name}”. Ela fica naquela máquina, não nesta.`;
+      ? `A configuração nova substitui a do host “${host.name}” (${host.address}).`
+      : `Configure a IA no host “${host.name}”. Ela fica naquela máquina, não nesta.`;
   }
   $("aiCurrent").hidden = !configured;
   $("aiCurrent").textContent = configured
-    ? `Em uso agora: ${state.ai.provider}. A chave antiga é substituída ao salvar.`
+    ? `Em uso agora: ${AI_LABEL[state.ai.provider] || state.ai.provider}.`
     : "";
-  if (state.ai.provider) $("aiProvider").value = state.ai.provider;
+  const options = [...$("aiProvider").options].map((o) => o.value);
+  if (state.ai.provider && options.includes(state.ai.provider)) $("aiProvider").value = state.ai.provider;
   $("aiKey").value = "";
-  $("aiHint").textContent = `Crie a chave em ${AI_SIGNUP[$("aiProvider").value] || AI_SIGNUP.groq}`;
+  syncAiProviderUi();
   $("aiModal").hidden = false;
-  $("aiKey").focus();
+  if ($("aiProvider").value === "claude-code") $("aiSave").focus();
+  else $("aiKey").focus();
 }
 
 function renderTips(id) {
@@ -2989,14 +3016,11 @@ function bind() {
   $("aiModal").addEventListener("click", (ev) => {
     if (ev.target.id === "aiModal") $("aiModal").hidden = true;
   });
-  $("aiProvider").addEventListener("change", () => {
-    const p = $("aiProvider").value;
-    $("aiHint").textContent = `Crie a chave em ${AI_SIGNUP[p] || AI_SIGNUP.groq}`;
-  });
+  $("aiProvider").addEventListener("change", syncAiProviderUi);
   $("aiSave").addEventListener("click", async () => {
-    const api_key = $("aiKey").value.trim();
     const provider = $("aiProvider").value;
-    if (!api_key) {
+    const api_key = $("aiKey").value.trim();
+    if (provider !== "claude-code" && !api_key) {
       $("aiHint").textContent = "Cole a chave antes de salvar.";
       return;
     }

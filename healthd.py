@@ -35,7 +35,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "healthD"
-VERSION = "0.15.1"
+VERSION = "0.16.0"
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 INSTALL_PREFIX = Path("/usr/linux-healthd")
 SYS_CONF_PATH = Path("/etc/linux-healthd.conf")
@@ -68,6 +68,12 @@ GEMINI_MODELS = (
     "gemini-3.6-flash",
 )
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+CLAUDE_MODELS = (
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-20250514",
+    "claude-3-5-haiku-latest",
+)
+AI_PROVIDERS = ("groq", "gemini", "openrouter", "claude", "claude-code")
 
 PRIORITY_META = {
     0: {"id": "emerg", "label": "Emergência", "short": "emerg", "weight": 12.0, "rank": 0},
@@ -2155,6 +2161,25 @@ def remote_http(
         return 504, {"error": "timeout", "message": "O host remoto demorou demais."}, "timeout"
 
 
+def find_claude_bin() -> str | None:
+    found = shutil.which("claude")
+    if found:
+        return found
+    home = Path.home()
+    for candidate in (
+        home / ".local" / "bin" / "claude",
+        home / ".claude" / "local" / "claude",
+        Path("/usr/local/bin/claude"),
+        Path("/usr/bin/claude"),
+    ):
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
 def guess_provider(api_key: str) -> str:
     if api_key.startswith("gsk_"):
         return "groq"
@@ -2162,6 +2187,8 @@ def guess_provider(api_key: str) -> str:
         return "gemini"
     if api_key.startswith("sk-or"):
         return "openrouter"
+    if api_key.startswith("sk-ant"):
+        return "claude"
     return "groq"
 
 
@@ -2184,28 +2211,65 @@ def resolve_ai(body: dict[str, Any] | None = None) -> tuple[str, str]:
         or os.environ.get("GEMINI_API_KEY")
         or os.environ.get("GOOGLE_API_KEY")
         or os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("CLAUDE_API_KEY")
         or saved.get("api_key")
         or ""
     ).strip()
     if not provider:
-        if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY"):
+            provider = "claude"
+        elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
             provider = "gemini"
         elif os.environ.get("OPENROUTER_API_KEY"):
             provider = "openrouter"
         else:
             provider = guess_provider(api_key)
+    if provider not in AI_PROVIDERS:
+        provider = guess_provider(api_key) if api_key else "groq"
     return provider, api_key
+
+
+def ai_is_ready(provider: str, api_key: str) -> bool:
+    if provider == "claude-code":
+        return bool(find_claude_bin())
+    return bool(api_key)
+
+
+def missing_ai(provider: str, api_key: str, action: str = "gerar dicas") -> dict[str, Any] | None:
+    if provider == "claude-code":
+        if find_claude_bin():
+            return None
+        return {
+            "error": "ai_not_configured",
+            "message": (
+                "Claude Code não está no PATH deste host. Instale o CLI `claude`, "
+                "rode `claude login` com o mesmo usuário do healthD, ou use a API da Anthropic."
+            ),
+            "status": ai_status(),
+        }
+    if api_key:
+        return None
+    return {
+        "error": "ai_not_configured",
+        "message": f"Configure uma chave para {action}.",
+        "status": ai_status(),
+    }
 
 
 def ai_status() -> dict[str, Any]:
     provider, api_key = resolve_ai()
+    ready = ai_is_ready(provider, api_key)
     return {
-        "configured": bool(api_key),
-        "provider": provider if api_key else None,
+        "configured": ready,
+        "provider": provider if ready else None,
+        "claude_code": {"available": bool(find_claude_bin())},
         "signup": {
             "groq": "https://console.groq.com/keys",
             "gemini": "https://aistudio.google.com/apikey",
             "openrouter": "https://openrouter.ai/keys",
+            "claude": "https://console.anthropic.com/settings/keys",
+            "claude-code": "https://code.claude.com/docs/en/quickstart",
         },
     }
 
@@ -2240,7 +2304,7 @@ def classify_http_error(status: int, detail: str) -> AiError:
     key_bad = status == 401 or "invalid api key" in lowered or "invalid_api_key" in lowered or "incorrect api key" in lowered
     if key_bad:
         return AiError(
-            "A chave foi recusada. Abra Configurar IA no painel e cole uma chave Groq válida (console.groq.com/keys).",
+            "A chave foi recusada. Abra Configurar IA no painel e cole uma chave válida.",
             status=status,
             retryable=False,
         )
@@ -2493,11 +2557,145 @@ def openrouter_complete(api_key: str, system: str, user: str) -> tuple[str, str]
     )
 
 
+def anthropic_messages(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for item in history:
+        role = str(item.get("role") or "user")
+        if role == "system":
+            continue
+        if role != "assistant":
+            role = "user"
+        content = str(item.get("content") or "")
+        if not content.strip():
+            continue
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] += "\n\n" + content
+        else:
+            out.append({"role": role, "content": content})
+    if out and out[0]["role"] != "user":
+        out.insert(0, {"role": "user", "content": "(início da conversa)"})
+    if not out:
+        out = [{"role": "user", "content": "(sem mensagem)"}]
+    return out
+
+
+def claude_complete_messages(
+    api_key: str,
+    system: str,
+    history: list[dict[str, str]],
+    json_mode: bool = False,
+) -> tuple[str, str]:
+    last_error: Exception | None = None
+    messages = anthropic_messages(history)
+    for model in CLAUDE_MODELS:
+        try:
+            payload = http_json(
+                "https://api.anthropic.com/v1/messages",
+                {
+                    "model": model,
+                    "max_tokens": 4096,
+                    "temperature": 0.2 if json_mode else 0.3,
+                    "system": system,
+                    "messages": messages,
+                },
+                {
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                timeout=70,
+            )
+            parts = payload.get("content") or []
+            text = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict))
+            if not text and parts:
+                text = str(parts[0].get("text") or "")
+            if not text:
+                raise KeyError("content")
+            return text, f"claude/{model}"
+        except AiError as exc:
+            last_error = exc
+            if not exc.retryable:
+                raise
+            continue
+        except (KeyError, IndexError, TypeError) as exc:
+            last_error = exc
+            continue
+    raise AiError(str(last_error) if last_error else "Claude não respondeu.")
+
+
+def claude_complete(api_key: str, system: str, user: str) -> tuple[str, str]:
+    return claude_complete_messages(api_key, system, [{"role": "user", "content": user}], json_mode=True)
+
+
+def chat_transcript(history: list[dict[str, str]]) -> str:
+    lines = []
+    for item in history:
+        role = "Usuário" if item.get("role") == "user" else "Assistente"
+        lines.append(f"{role}:\n{item.get('content') or ''}")
+    return "\n\n".join(lines).strip() or "(sem mensagem)"
+
+
+def claude_code_complete_messages(
+    system: str,
+    history: list[dict[str, str]],
+) -> tuple[str, str]:
+    binary = find_claude_bin()
+    if not binary:
+        raise AiError(
+            "Claude Code não está no PATH. Instale o CLI `claude` e rode `claude login`.",
+            retryable=False,
+        )
+    prompt = chat_transcript(history)
+    cmd = [
+        binary,
+        "--print",
+        "--output-format",
+        "json",
+        "--max-turns",
+        "1",
+        "--system-prompt",
+        system,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=90,
+            check=False,
+            cwd=str(tempfile.gettempdir()),
+        )
+    except FileNotFoundError as exc:
+        raise AiError("Claude Code não está instalado neste host.", retryable=False) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AiError("Claude Code demorou demais para responder.", retryable=True) from exc
+    stdout = proc.stdout.decode("utf-8", errors="replace").strip()
+    stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0 and not stdout:
+        raise AiError((stderr or f"claude saiu com código {proc.returncode}")[:240], retryable=False)
+    text = stdout
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, dict):
+            if data.get("is_error"):
+                raise AiError(str(data.get("result") or stderr or "Claude Code retornou erro.")[:240])
+            text = str(data.get("result") or data.get("text") or stdout)
+    except json.JSONDecodeError:
+        pass
+    if not text.strip():
+        raise AiError(stderr or "Claude Code não devolveu texto.")
+    return text, "claude-code"
+
+
 def complete_ai(provider: str, api_key: str, system: str, user: str) -> tuple[str, str, str]:
     if provider == "gemini":
         text, model = gemini_complete(api_key, system, user)
     elif provider == "openrouter":
         text, model = openrouter_complete(api_key, system, user)
+    elif provider == "claude":
+        text, model = claude_complete(api_key, system, user)
+    elif provider == "claude-code":
+        text, model = claude_code_complete_messages(system, [{"role": "user", "content": user}])
     else:
         text, model = groq_complete(api_key, system, user)
         provider = "groq"
@@ -2518,6 +2716,10 @@ def complete_chat(
             [{"role": "system", "content": system}, *history],
             json_mode=False,
         )
+    elif provider == "claude":
+        text, model = claude_complete_messages(api_key, system, history, json_mode=False)
+    elif provider == "claude-code":
+        text, model = claude_code_complete_messages(system, history)
     else:
         text, model = groq_complete_messages(
             api_key,
@@ -2632,12 +2834,9 @@ def attach_chat_thread(payload: dict[str, Any], kind: str, context_user: str, as
 
 def continue_ai_chat(body: dict[str, Any]) -> dict[str, Any]:
     provider, api_key = resolve_ai(body)
-    if not api_key:
-        return {
-            "error": "ai_not_configured",
-            "message": "Configure uma chave gratuita para continuar a conversa.",
-            "status": ai_status(),
-        }
+    missing = missing_ai(provider, api_key, "continuar a conversa")
+    if missing:
+        return missing
     thread_id = str(body.get("thread_id") or "").strip()
     message = str(body.get("message") or "").strip()[:CHAT_MAX_MESSAGE]
     if not thread_id or not re.fullmatch(r"[a-f0-9]{16}", thread_id):
@@ -2688,12 +2887,9 @@ def continue_ai_chat(body: dict[str, Any]) -> dict[str, Any]:
 
 def generate_tips(issue: dict[str, Any], report: dict[str, Any] | None, body: dict[str, Any]) -> dict[str, Any]:
     provider, api_key = resolve_ai(body)
-    if not api_key:
-        return {
-            "error": "ai_not_configured",
-            "message": "Configure uma chave gratuita para gerar dicas.",
-            "status": ai_status(),
-        }
+    missing = missing_ai(provider, api_key)
+    if missing:
+        return missing
     cache_key = str(issue.get("id") or hashlib.sha1(str(issue.get("title")).encode()).hexdigest()[:16])
     now = time.time()
     system, user = build_tips_prompt(issue, report)
@@ -2771,12 +2967,9 @@ def generate_unit_tips(
     if not unit:
         return {"error": "missing_unit", "message": "Informe uma unidade systemd."}
     provider, api_key = resolve_ai(body)
-    if not api_key:
-        return {
-            "error": "ai_not_configured",
-            "message": "Configure uma chave gratuita para gerar dicas.",
-            "status": ai_status(),
-        }
+    missing = missing_ai(provider, api_key)
+    if missing:
+        return missing
     logs = collect_unit_logs(unit, "", "boot", 150, user_only, demo)
     if logs.get("error"):
         return logs
@@ -4389,12 +4582,9 @@ def compact_machine_for_ai(report: dict[str, Any]) -> dict[str, Any]:
 
 def generate_machine_tips(body: dict[str, Any], demo: bool) -> dict[str, Any]:
     provider, api_key = resolve_ai(body)
-    if not api_key:
-        return {
-            "error": "ai_not_configured",
-            "message": "Configure uma chave gratuita para gerar dicas.",
-            "status": ai_status(),
-        }
+    missing = missing_ai(provider, api_key)
+    if missing:
+        return missing
     report = collect_machine_report(demo=demo, refresh=bool(body.get("refresh")))
     context = compact_machine_for_ai(report)
     cache_key = "machine:" + hashlib.sha1(
@@ -5095,19 +5285,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(payload, status if 100 <= status <= 599 else 502)
 
     def _save_ai(self, body: dict[str, Any]) -> None:
+        provider = str(body.get("provider") or "").strip().lower()
         api_key = str(body.get("api_key") or "").strip()
+        if provider == "claude-code":
+            if not find_claude_bin():
+                self._send_json(
+                    {
+                        "error": "missing_claude",
+                        "message": (
+                            "Não achei o CLI `claude` neste host. Instale o Claude Code, "
+                            "faça `claude login` com o mesmo usuário do healthD, ou escolha Claude (API)."
+                        ),
+                    },
+                    400,
+                )
+                return
+            save_ai_config("claude-code", "")
+            clear_tips_cache()
+            self._send_json(ai_status())
+            return
         if not api_key:
             self._send_json({"error": "missing_key", "message": "Cole uma chave de API."}, 400)
             return
-        provider = str(body.get("provider") or "").strip().lower()
         detected = guess_provider(api_key)
-        if detected in {"groq", "gemini", "openrouter"}:
-            if provider not in {"groq", "gemini", "openrouter"} or (
-                detected != provider and api_key.startswith(("gsk_", "AIza", "sk-or"))
+        if detected in AI_PROVIDERS and detected != "claude-code":
+            if provider not in AI_PROVIDERS or (
+                detected != provider and api_key.startswith(("gsk_", "AIza", "sk-or", "sk-ant"))
             ):
                 provider = detected
-        if provider not in {"groq", "gemini", "openrouter"}:
-            provider = detected
+        if provider not in AI_PROVIDERS or provider == "claude-code":
+            provider = detected if detected != "claude-code" else "groq"
         save_ai_config(provider, api_key)
         clear_tips_cache()
         self._send_json(ai_status())
@@ -5296,7 +5503,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lines", type=int, default=DEFAULT_LINES, help="Máximo de eventos lidos do journal")
     parser.add_argument("--user", action="store_true", help="Ler apenas o journal do usuário")
     parser.add_argument("--demo", action="store_true", help="Usar dados sintéticos (sem journalctl)")
-    parser.add_argument("--ai-provider", choices=("groq", "gemini", "openrouter"), help="Provedor de IA Tips (padrão: groq)")
+    parser.add_argument(
+        "--ai-provider",
+        choices=AI_PROVIDERS,
+        help="Provedor de IA Tips (padrão: groq)",
+    )
     parser.add_argument("--ai-key", help="Chave da API de IA (senão usa ~/.config/healthd/ai.json ou env)")
     parser.add_argument("--version", action="store_true", help="Mostrar versão e sair")
     args = parser.parse_args(argv)
@@ -5344,9 +5555,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Modo demo: dados sintéticos")
     status = ai_status()
     if status["configured"]:
-        print(f"IA Tips: {status['provider']} (plano gratuito)")
+        print(f"IA Tips: {status['provider']}")
     else:
-        print("IA Tips: não configurada — cole uma chave Groq grátis no painel")
+        print("IA Tips: não configurada — cole uma chave no painel (Groq, Gemini, OpenRouter ou Claude)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

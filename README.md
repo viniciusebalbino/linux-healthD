@@ -19,19 +19,22 @@ Sem dependências extras: só Python 3 (e `journalctl` / `systemctl` no Linux).
 - **Hosts da rede**: cadastre outras máquinas (`ip:porta`) com um **usuário e senha Linux** daquela máquina (precisa estar no grupo `healthd`); o seletor no topo troca o painel sem abrir outro endereço
 - OOM: processos mortos por falta de memória, lidos do journal
 - Diff entre boots: o que surgiu neste boot e não estava no anterior
-- **IA Tips**: para cada problema agrupado, envia o contexto à Groq (plano gratuito) e devolve causa provável, passos e comandos
+- **IA Tips**: para cada problema agrupado, envia o contexto à IA (Groq, Gemini, OpenRouter, Claude ou Claude Code) e devolve causa provável, passos e comandos
 
 O percentual de melhoria é uma **heurística** (frequência × severidade × criticidade da unidade × palavras como OOM, I/O, timeout). Não é medição real de performance.
 
-## IA Tips (plano gratuito)
+## IA Tips
 
-O painel usa a API da [Groq](https://console.groq.com/keys) no free tier (Llama, sem cartão). Também aceita Gemini e OpenRouter.
+O painel usa a API da [Groq](https://console.groq.com/keys) no free tier (Llama, sem cartão). Também aceita Gemini, OpenRouter, a API da [Anthropic (Claude)](https://console.anthropic.com/settings/keys) e o [Claude Code](https://code.claude.com/docs/en/quickstart) local.
 
-1. Crie uma chave em [console.groq.com/keys](https://console.groq.com/keys)
-2. No dashboard, clique em **Configurar IA** e cole a chave  
-   ou rode `python3 healthd.py --ai-provider groq --ai-key gsk_...`
+1. No dashboard, clique em **Configurar IA** e escolha o provedor
+2. Groq / Gemini / OpenRouter / Claude: cole a chave  
+   Claude Code: instale o CLI `claude`, rode `claude login` com o **mesmo usuário** do healthD e salve sem chave  
+   ou `python3 healthd.py --ai-provider groq --ai-key gsk_...`
 
 A chave fica em `~/.config/healthd/ai.json` (ainda lê a pasta antiga `~/.config/journalctl-obs/` se existir). Nada é enviado até você clicar em **IA Tips**. Depois da análise, o painel abre um chat no mesmo contexto: dá para perguntar, colar a saída de um comando e seguir o debug.
+
+Se o healthD roda como serviço root em `/usr/linux-healthd`, o Claude Code precisa do login em `/root`. Nesse caso a API Anthropic (`sk-ant-…`) é o caminho mais simples.
 
 ## Uso
 

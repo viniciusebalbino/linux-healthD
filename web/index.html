@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/assets/app.css?v=25">
+  <link rel="stylesheet" href="/assets/app.css?v=26">
 </head>
 <body>
   <div class="noise" aria-hidden="true"></div>
@@ -101,7 +101,7 @@
         <p class="rail__meta" id="diskMeta">ainda não medido</p>
       </div>
       <div class="rail__update" id="updateBox">
-        <p id="updateMeta">v0.15.1</p>
+        <p id="updateMeta">v0.16.0</p>
         <button type="button" class="ghost" id="updateBtn" hidden>Atualizar agora</button>
       </div>
     </aside>
@@ -241,7 +241,7 @@
 
       <footer class="foot">
         Sem telemetria de produto. As dicas de IA só saem da máquina quando você clica em
-        <strong>IA Tips</strong> ( Groq / Gemini / OpenRouter no plano gratuito ).
+        <strong>IA Tips</strong> ( Groq, Gemini, OpenRouter, Claude ou Claude Code ).
       </footer>
       </div>
 
@@ -504,9 +504,11 @@
           <option value="groq">Groq (Llama, grátis)</option>
           <option value="gemini">Google Gemini (grátis)</option>
           <option value="openrouter">OpenRouter (modelos :free)</option>
+          <option value="claude">Claude (API Anthropic)</option>
+          <option value="claude-code">Claude Code (CLI local)</option>
         </select>
       </label>
-      <label>
+      <label id="aiKeyRow">
         Chave da API
         <input id="aiKey" type="password" autocomplete="off" placeholder="Cole a chave nova aqui">
       </label>
@@ -556,6 +558,6 @@
     </div>
   </div>
 
-  <script src="/assets/app.js?v=25"></script>
+  <script src="/assets/app.js?v=26"></script>
 </body>
 </html>
